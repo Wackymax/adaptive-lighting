@@ -1,5 +1,6 @@
 """Test Adaptive Lighting config flow."""
 
+import voluptuous_serialize
 from homeassistant.components.adaptive_lighting.const import (
     CONF_SUNRISE_TIME,
     CONF_SUNSET_TIME,
@@ -11,10 +12,16 @@ from homeassistant.components.adaptive_lighting.const import (
 from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_NAME
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv
 
 from tests.common import MockConfigEntry
 
-DEFAULT_DATA = {key: default for key, default, _ in VALIDATION_TUPLES}
+# Optional entity selectors are omitted when unset.  Passing None through an
+# EntitySelector is invalid, while the runtime validator still supplies None
+# internally for an unset single-entity context input.
+DEFAULT_DATA = {
+    key: default for key, default, _ in VALIDATION_TUPLES if default is not None
+}
 
 
 async def test_flow_manual_configuration(hass):
@@ -67,6 +74,12 @@ async def test_options(hass):
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "init"
+    # Exercise the same serialization path used by the config-flow HTTP API;
+    # backend-only validation does not catch unsupported selector wrappers.
+    voluptuous_serialize.convert(
+        result["data_schema"],
+        custom_serializer=cv.custom_serializer,
+    )
 
     data = DEFAULT_DATA.copy()
     data[CONF_SUNRISE_TIME] = NONE_STR
@@ -78,6 +91,10 @@ async def test_options(hass):
     assert result["type"] == FlowResultType.CREATE_ENTRY
     for key, value in data.items():
         assert result["data"][key] == value
+
+    for key, default, _ in VALIDATION_TUPLES:
+        if default is None:
+            assert key not in result["data"]
 
 
 async def test_incorrect_options(hass):

@@ -136,6 +136,11 @@ async def test_classification_uses_vendored_ha_capabilities(
         "calendar",
         "south_africa_public_holidays",
     )
+    holiday_sensor = _entity(
+        entity_registry,
+        "binary_sensor",
+        "workday_sensor_za",
+    )
 
     hass.states.async_set(
         light.entity_id,
@@ -151,6 +156,11 @@ async def test_classification_uses_vendored_ha_capabilities(
         holiday.entity_id,
         "off",
         {"friendly_name": "South Africa Public Holidays"},
+    )
+    hass.states.async_set(
+        holiday_sensor.entity_id,
+        "off",
+        {"workdays": ["holiday"], "excludes": []},
     )
 
     assert classify_entity(light, hass.states.get(light.entity_id)).capabilities == (
@@ -186,6 +196,12 @@ async def test_classification_uses_vendored_ha_capabilities(
     assert {"holiday_calendar", "context"}.issubset(
         classify_entity(holiday, hass.states.get(holiday.entity_id)).capabilities,
     )
+    assert {"holiday_calendar", "context"}.issubset(
+        classify_entity(
+            holiday_sensor,
+            hass.states.get(holiday_sensor.entity_id),
+        ).capabilities,
+    )
 
     coordinator = EntityDiscoveryCoordinator(
         hass,
@@ -207,6 +223,7 @@ async def test_classification_uses_vendored_ha_capabilities(
                 illuminance,
                 media,
                 holiday,
+                holiday_sensor,
             )
         ),
     )

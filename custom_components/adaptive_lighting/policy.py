@@ -116,7 +116,9 @@ class PolicyConfig:
         ):
             cap = getattr(self, cap_name)
             if cap is not None:
-                object.__setattr__(self, target_name, min(getattr(self, target_name), cap))
+                object.__setattr__(
+                    self, target_name, min(getattr(self, target_name), cap),
+                )
         if self.night_brightness_cap is not None:
             object.__setattr__(
                 self,
@@ -133,7 +135,9 @@ class PolicyConfig:
             # Invalid safety configuration must require maximum confidence,
             # never silently lower the threshold.
             confidence = 1.0
-        object.__setattr__(self, "minimum_action_confidence", _clamp(float(confidence), 0.0, 1.0))
+        object.__setattr__(
+            self, "minimum_action_confidence", _clamp(float(confidence), 0.0, 1.0),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,19 +235,21 @@ def _target_for(
     target: float | None
     reason: str
     if intent is Intent.MANUAL:
-        requested = _signal_value(snapshot, "requested_brightness")
         current = _signal_value(snapshot, "current_brightness")
-        if requested is not None:
-            target = _bounded_general(requested, config)
-            reason = "manual brightness is retained without adaptation"
-        elif current is not None:
+        requested = _signal_value(snapshot, "requested_brightness")
+        if current is not None:
             target = _bounded_general(current, config)
             reason = "current brightness is retained without adaptation"
+        elif requested is not None:
+            target = _bounded_general(requested, config)
+            reason = "manual brightness is retained without adaptation"
         else:
             target = None
             reason = "manual hold is active and no brightness value was available"
     elif intent is Intent.SLEEP:
-        target = _bounded_capped(config.sleep_brightness, config.sleep_max_brightness, config)
+        target = _bounded_capped(
+            config.sleep_brightness, config.sleep_max_brightness, config,
+        )
         reason = f"sleep target is constrained by the {config.sleep_max_brightness:g}% sleep cap"
     elif intent is Intent.NIGHT_PATH:
         target = _bounded_capped(

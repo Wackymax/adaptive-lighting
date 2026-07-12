@@ -14,6 +14,8 @@ from .const import (
     ATTR_ADAPTIVE_LIGHTING_MANAGER,
     CONF_NAME,
     DOMAIN,
+    SERVICE_EXPLAIN,
+    SERVICE_PREVIEW,
     UNDO_UPDATE_LISTENER,
 )
 
@@ -94,6 +96,11 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
         # no more config_entries
         manager = data.pop(ATTR_ADAPTIVE_LIGHTING_MANAGER)
         manager.disable()
+        # Preview/explain are global domain services registered by the switch
+        # platform. Do not leave stale handlers after the final profile unloads.
+        for service in (SERVICE_PREVIEW, SERVICE_EXPLAIN):
+            if hass.services.has_service(DOMAIN, service):
+                hass.services.async_remove(DOMAIN, service)
 
     if not data:
         hass.data.pop(DOMAIN)

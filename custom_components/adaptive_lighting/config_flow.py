@@ -10,7 +10,17 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 
 from .const import (  # pylint: disable=unused-import
+    CONF_ENERGY_CONSTRAINT_ENTITY,
+    CONF_HOME_STATE_ENTITY,
+    CONF_ILLUMINANCE_ENTITIES,
     CONF_LIGHTS,
+    CONF_MANUAL_HOLD_ENTITY,
+    CONF_MEDIA_ENTITIES,
+    CONF_OCCUPANCY_ENTITIES,
+    CONF_PRESENCE_ENTITIES,
+    CONF_SECURITY_STATE_ENTITY,
+    CONF_SEMANTIC_INTENT_ENTITY,
+    CONF_SLEEP_ENTITY,
     DOMAIN,
     EXTRA_VALIDATION,
     NONE_STR,
@@ -162,10 +172,42 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 ),
             ),
         }
+        for name in (
+            CONF_OCCUPANCY_ENTITIES,
+            CONF_PRESENCE_ENTITIES,
+            CONF_ILLUMINANCE_ENTITIES,
+            CONF_MEDIA_ENTITIES,
+        ):
+            to_replace[name] = EntitySelector(
+                EntitySelectorConfig(
+                    multiple=True,
+                ),
+            )
+        for name in (
+            CONF_HOME_STATE_ENTITY,
+            CONF_SECURITY_STATE_ENTITY,
+            CONF_SLEEP_ENTITY,
+            CONF_ENERGY_CONSTRAINT_ENTITY,
+            CONF_MANUAL_HOLD_ENTITY,
+            CONF_SEMANTIC_INTENT_ENTITY,
+        ):
+            # Optional keys are omitted when unset below. Wrapping a selector
+            # in vol.Any(..., None) validates in Python but cannot be serialized
+            # by Home Assistant's config-flow frontend.
+            to_replace[name] = EntitySelector(
+                EntitySelectorConfig(multiple=False),
+            )
 
         options_schema = {}
         for name, default, validation in VALIDATION_TUPLES:
-            key = vol.Optional(name, default=conf.options.get(name, default))
+            configured_default = conf.options.get(name, default)
+            if configured_default is None:
+                # EntitySelector does not accept None.  An unset optional
+                # selector must be absent from the form payload instead of
+                # being materialized as a None default.
+                key = vol.Optional(name)
+            else:
+                key = vol.Optional(name, default=configured_default)
             value = to_replace.get(name, validation)
             options_schema[key] = value
 

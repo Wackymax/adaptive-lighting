@@ -258,3 +258,153 @@ change_switch_settings:
       example: 0
       selector:
         text: null
+    intelligence_enabled:
+      description: Enable additive context-intelligence evaluation.
+      required: false
+      example: false
+      selector:
+        boolean: null
+    intelligence_shadow_mode:
+      description: Compute and expose decisions without any Adaptive Lighting light service calls.
+      required: false
+      example: true
+      selector:
+        boolean: null
+    occupancy_entities:
+      description: Entity IDs used as occupancy context signals.
+      required: false
+      selector:
+        entity:
+          multiple: true
+    presence_entities:
+      description: Entity IDs used as presence context signals.
+      required: false
+      selector:
+        entity:
+          multiple: true
+    illuminance_entities:
+      description: Entity IDs used as illuminance context signals.
+      required: false
+      selector:
+        entity:
+          multiple: true
+    home_state_entity:
+      description: Entity ID containing the home/away state.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    security_state_entity:
+      description: Entity ID containing the security state.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    sleep_entity:
+      description: Entity ID containing the sleep state.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    media_entities:
+      description: Media-player entity IDs used as media context signals.
+      required: false
+      selector:
+        entity:
+          domain: media_player
+          multiple: true
+    energy_constraint_entity:
+      description: Entity ID containing an energy constraint.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    manual_hold_entity:
+      description: Entity ID that holds manual takeover.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    semantic_intent_entity:
+      description: Entity ID containing a semantic lighting intent.
+      required: false
+      selector:
+        entity:
+          multiple: false
+    task_brightness_cap:
+      description: Maximum brightness percentage for task intent.
+      required: false
+      example: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    ambient_brightness_cap:
+      description: Maximum brightness percentage for ambient intent.
+      required: false
+      example: 60
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    video_brightness_cap:
+      description: Maximum brightness percentage for video intent.
+      required: false
+      example: 30
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    night_brightness_cap:
+      description: Maximum brightness percentage for night intent.
+      required: false
+      example: 10
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    prelight_brightness_cap:
+      description: Maximum brightness percentage for prelight intent.
+      required: false
+      example: 25
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+preview:
+  description: Publish a read-only context-intelligence preview event without changing any lights.
+  fields:
+    entity_id:
+      description: The Adaptive Lighting switch to preview.
+      selector:
+        entity:
+          integration: adaptive_lighting
+          domain: switch
+          multiple: false
+    lights:
+      description: Optional light entity IDs to preview.
+      selector:
+        entity:
+          domain: light
+          multiple: true
+explain:
+  description: Publish a read-only context-intelligence explanation event without changing any lights.
+  fields:
+    entity_id:
+      description: The Adaptive Lighting switch to explain.
+      selector:
+        entity:
+          integration: adaptive_lighting
+          domain: switch
+          multiple: false
+    lights:
+      description: Optional light entity IDs to explain.
+      selector:
+        entity:
+          domain: light
+          multiple: true

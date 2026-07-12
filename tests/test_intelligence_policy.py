@@ -14,9 +14,7 @@ import pytest
 # ruff: noqa: E402
 _PACKAGE = "custom_components.adaptive_lighting"
 _PACKAGE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "custom_components"
-    / "adaptive_lighting"
+    Path(__file__).resolve().parents[1] / "custom_components" / "adaptive_lighting"
 )
 if (package := sys.modules.get(_PACKAGE)) is None:
     package = types.ModuleType(_PACKAGE)
@@ -99,6 +97,20 @@ def test_manual_control_is_never_fought() -> None:
     assert decision.can_turn_off is False
     assert decision.should_apply is False
     assert any("will not fight" in reason for reason in decision.reasons)
+
+
+def test_manual_control_prefers_observed_brightness_over_old_baseline() -> None:
+    decision = decide(
+        ContextSnapshot(
+            manual_hold=active(source="physical-switch"),
+            requested_brightness=signal(80, source="old-baseline"),
+            current_brightness=signal(20, source="light-state"),
+        ),
+    )
+
+    assert decision.intent is Intent.MANUAL
+    assert decision.brightness_target == 20
+    assert decision.can_adjust is False
 
 
 def test_unavailable_inputs_degrade_without_turning_companion_on_or_off() -> None:
@@ -261,8 +273,12 @@ def test_explanation_contains_reasons_rejected_intents_and_provenance() -> None:
 
     assert explanation.intent is Intent.TASK
     assert explanation.reasons == decision.reasons
-    assert any(item.intent is Intent.VIDEO for item in explanation.rejected_alternatives)
-    assert any(item.source == "desk-automation" for item in explanation.input_provenance)
+    assert any(
+        item.intent is Intent.VIDEO for item in explanation.rejected_alternatives
+    )
+    assert any(
+        item.source == "desk-automation" for item in explanation.input_provenance
+    )
     assert "task" in explanation.as_text()
 
 

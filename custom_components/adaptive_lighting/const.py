@@ -58,8 +58,7 @@ DOCS[CONF_INCLUDE_CONFIG_IN_ATTRIBUTES] = (
 
 CONF_INITIAL_TRANSITION, DEFAULT_INITIAL_TRANSITION = "initial_transition", 1
 DOCS[CONF_INITIAL_TRANSITION] = (
-    "Duration of the first transition when lights turn "
-    "from `off` to `on` in seconds. ⏲️"
+    "Duration of the first transition when lights turn from `off` to `on` in seconds. ⏲️"
 )
 
 CONF_SLEEP_TRANSITION, DEFAULT_SLEEP_TRANSITION = "sleep_transition", 1
@@ -152,8 +151,7 @@ DOCS[CONF_MIN_SUNRISE_TIME] = (
 
 CONF_MAX_SUNRISE_TIME = "max_sunrise_time"
 DOCS[CONF_MAX_SUNRISE_TIME] = (
-    "Set the latest virtual sunrise time (HH:MM:SS), allowing"
-    " for earlier sunrises. 🌅"
+    "Set the latest virtual sunrise time (HH:MM:SS), allowing for earlier sunrises. 🌅"
 )
 
 CONF_SUNSET_OFFSET, DEFAULT_SUNSET_OFFSET = "sunset_offset", 0
@@ -272,6 +270,129 @@ DOCS[CONF_MULTI_LIGHT_INTERCEPT] = (
     "Requires `intercept` to be enabled."
 )
 
+# Context-intelligence options are additive.  Keeping the defaults inert makes old
+# YAML and config entries behave exactly as they did before this integration was
+# added.  Shadow mode defaults to true so a newly enabled policy cannot actuate
+# lights until the user explicitly opts into active mode.
+CONF_INTELLIGENCE_ENABLED, DEFAULT_INTELLIGENCE_ENABLED = (
+    "intelligence_enabled",
+    False,
+)
+DOCS[CONF_INTELLIGENCE_ENABLED] = (
+    "Enable context-intelligence target evaluation. It does not turn lights on."
+)
+
+CONF_INTELLIGENCE_SHADOW_MODE, DEFAULT_INTELLIGENCE_SHADOW_MODE = (
+    "intelligence_shadow_mode",
+    True,
+)
+DOCS[CONF_INTELLIGENCE_SHADOW_MODE] = (
+    "Compute and expose intelligence decisions without any Adaptive Lighting light service calls."
+)
+
+CONF_INTELLIGENCE_TRAINING_ENABLED, DEFAULT_INTELLIGENCE_TRAINING_ENABLED = (
+    "intelligence_training_enabled",
+    False,
+)
+CONF_INTELLIGENCE_TRAINING_DAYS, DEFAULT_INTELLIGENCE_TRAINING_DAYS = (
+    "intelligence_training_days",
+    7,
+)
+CONF_INTELLIGENCE_AUTO_PROMOTE, DEFAULT_INTELLIGENCE_AUTO_PROMOTE = (
+    "intelligence_auto_promote",
+    False,
+)
+CONF_INTELLIGENCE_MINIMUM_SAMPLES, DEFAULT_INTELLIGENCE_MINIMUM_SAMPLES = (
+    "intelligence_minimum_samples",
+    8,
+)
+CONF_INTELLIGENCE_MINIMUM_CONFIDENCE, DEFAULT_INTELLIGENCE_MINIMUM_CONFIDENCE = (
+    "intelligence_minimum_confidence",
+    0.8,
+)
+CONF_INTELLIGENCE_DURABILITY_SECONDS, DEFAULT_INTELLIGENCE_DURABILITY_SECONDS = (
+    "intelligence_durability_seconds",
+    120,
+)
+DOCS.update(
+    {
+        CONF_INTELLIGENCE_TRAINING_ENABLED: "Learn bounded local preferences in shadow mode.",
+        CONF_INTELLIGENCE_TRAINING_DAYS: "Days to observe before promotion is evaluated.",
+        CONF_INTELLIGENCE_AUTO_PROMOTE: "After training gates pass, permit high-confidence active adjustments.",
+        CONF_INTELLIGENCE_MINIMUM_SAMPLES: "Minimum accepted human preference samples before promotion.",
+        CONF_INTELLIGENCE_MINIMUM_CONFIDENCE: "Minimum promotion confidence from 0 to 1.",
+        CONF_INTELLIGENCE_DURABILITY_SECONDS: "Seconds a manual correction must persist before learning.",
+    },
+)
+
+CONF_OCCUPANCY_ENTITIES, DEFAULT_OCCUPANCY_ENTITIES = "occupancy_entities", []
+CONF_PRESENCE_ENTITIES, DEFAULT_PRESENCE_ENTITIES = "presence_entities", []
+CONF_ILLUMINANCE_ENTITIES, DEFAULT_ILLUMINANCE_ENTITIES = "illuminance_entities", []
+CONF_HOME_STATE_ENTITY, DEFAULT_HOME_STATE_ENTITY = "home_state_entity", None
+CONF_SECURITY_STATE_ENTITY, DEFAULT_SECURITY_STATE_ENTITY = (
+    "security_state_entity",
+    None,
+)
+CONF_SLEEP_ENTITY, DEFAULT_SLEEP_ENTITY = "sleep_entity", None
+CONF_MEDIA_ENTITIES, DEFAULT_MEDIA_ENTITIES = "media_entities", []
+CONF_ENERGY_CONSTRAINT_ENTITY, DEFAULT_ENERGY_CONSTRAINT_ENTITY = (
+    "energy_constraint_entity",
+    None,
+)
+CONF_MANUAL_HOLD_ENTITY, DEFAULT_MANUAL_HOLD_ENTITY = "manual_hold_entity", None
+CONF_SEMANTIC_INTENT_ENTITY, DEFAULT_SEMANTIC_INTENT_ENTITY = (
+    "semantic_intent_entity",
+    None,
+)
+
+# These are caps, rather than requested brightnesses.  A policy can therefore
+# lower the existing Adaptive Lighting target without bypassing its baseline.
+CONF_TASK_BRIGHTNESS_CAP, DEFAULT_TASK_BRIGHTNESS_CAP = "task_brightness_cap", 100
+CONF_AMBIENT_BRIGHTNESS_CAP, DEFAULT_AMBIENT_BRIGHTNESS_CAP = (
+    "ambient_brightness_cap",
+    60,
+)
+CONF_VIDEO_BRIGHTNESS_CAP, DEFAULT_VIDEO_BRIGHTNESS_CAP = (
+    "video_brightness_cap",
+    30,
+)
+CONF_NIGHT_BRIGHTNESS_CAP, DEFAULT_NIGHT_BRIGHTNESS_CAP = (
+    "night_brightness_cap",
+    10,
+)
+CONF_PRELIGHT_BRIGHTNESS_CAP, DEFAULT_PRELIGHT_BRIGHTNESS_CAP = (
+    "prelight_brightness_cap",
+    25,
+)
+
+# Aliases keep the option names discoverable to callers that group all
+# intelligence constants under the feature prefix.
+CONF_INTELLIGENCE_TASK_BRIGHTNESS_CAP = CONF_TASK_BRIGHTNESS_CAP
+CONF_INTELLIGENCE_AMBIENT_BRIGHTNESS_CAP = CONF_AMBIENT_BRIGHTNESS_CAP
+CONF_INTELLIGENCE_VIDEO_BRIGHTNESS_CAP = CONF_VIDEO_BRIGHTNESS_CAP
+CONF_INTELLIGENCE_NIGHT_BRIGHTNESS_CAP = CONF_NIGHT_BRIGHTNESS_CAP
+CONF_INTELLIGENCE_PRELIGHT_BRIGHTNESS_CAP = CONF_PRELIGHT_BRIGHTNESS_CAP
+
+DOCS.update(
+    {
+        CONF_OCCUPANCY_ENTITIES: "Entity IDs used as occupancy context signals.",
+        CONF_PRESENCE_ENTITIES: "Entity IDs used as presence context signals.",
+        CONF_ILLUMINANCE_ENTITIES: "Entity IDs used as illuminance context signals.",
+        CONF_HOME_STATE_ENTITY: "Entity ID containing the home/away state.",
+        CONF_SECURITY_STATE_ENTITY: "Entity ID containing the security state.",
+        CONF_SLEEP_ENTITY: "Entity ID containing the sleep state.",
+        CONF_MEDIA_ENTITIES: "Media-player entity IDs used as media context signals.",
+        CONF_ENERGY_CONSTRAINT_ENTITY: "Entity ID containing an energy constraint.",
+        CONF_MANUAL_HOLD_ENTITY: "Entity ID that holds manual takeover.",
+        CONF_SEMANTIC_INTENT_ENTITY: "Entity ID containing a semantic lighting intent.",
+        CONF_TASK_BRIGHTNESS_CAP: "Maximum brightness percentage for task intent.",
+        CONF_AMBIENT_BRIGHTNESS_CAP: "Maximum brightness percentage for ambient intent.",
+        CONF_VIDEO_BRIGHTNESS_CAP: "Maximum brightness percentage for video intent.",
+        CONF_NIGHT_BRIGHTNESS_CAP: "Maximum brightness percentage for night intent.",
+        CONF_PRELIGHT_BRIGHTNESS_CAP: "Maximum brightness percentage for prelight intent.",
+    },
+)
+
 SLEEP_MODE_SWITCH = "sleep_mode_switch"
 ADAPT_COLOR_SWITCH = "adapt_color_switch"
 ADAPT_BRIGHTNESS_SWITCH = "adapt_brightness_switch"
@@ -295,6 +416,16 @@ DOCS[CONF_USE_DEFAULTS] = (
     "Sets the default values not specified in this service call. Options: "
     '"current" (default, retains current values), "factory" (resets to '
     'documented defaults), or "configuration" (reverts to switch config defaults). ⚙️'
+)
+
+SERVICE_PREVIEW = "preview"
+SERVICE_EXPLAIN = "explain"
+
+INTELLIGENCE_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_ENTITY_ID): cv.entity_ids,  # type: ignore[arg-type]
+        vol.Optional(CONF_LIGHTS, default=[]): cv.entity_ids,  # type: ignore[arg-type]
+    },
 )
 
 TURNING_OFF_DELAY = 5
@@ -405,6 +536,73 @@ VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
     (CONF_INTERCEPT, DEFAULT_INTERCEPT, bool),
     (CONF_MULTI_LIGHT_INTERCEPT, DEFAULT_MULTI_LIGHT_INTERCEPT, bool),
     (CONF_INCLUDE_CONFIG_IN_ATTRIBUTES, DEFAULT_INCLUDE_CONFIG_IN_ATTRIBUTES, bool),
+    (CONF_INTELLIGENCE_ENABLED, DEFAULT_INTELLIGENCE_ENABLED, bool),
+    (CONF_INTELLIGENCE_SHADOW_MODE, DEFAULT_INTELLIGENCE_SHADOW_MODE, bool),
+    (
+        CONF_INTELLIGENCE_TRAINING_ENABLED,
+        DEFAULT_INTELLIGENCE_TRAINING_ENABLED,
+        bool,
+    ),
+    (
+        CONF_INTELLIGENCE_TRAINING_DAYS,
+        DEFAULT_INTELLIGENCE_TRAINING_DAYS,
+        int_between(1, 365),
+    ),
+    (CONF_INTELLIGENCE_AUTO_PROMOTE, DEFAULT_INTELLIGENCE_AUTO_PROMOTE, bool),
+    (
+        CONF_INTELLIGENCE_MINIMUM_SAMPLES,
+        DEFAULT_INTELLIGENCE_MINIMUM_SAMPLES,
+        int_between(1, 10000),
+    ),
+    (
+        CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
+        DEFAULT_INTELLIGENCE_MINIMUM_CONFIDENCE,
+        vol.All(vol.Coerce(float), vol.Range(min=0, max=1)),
+    ),
+    (
+        CONF_INTELLIGENCE_DURABILITY_SECONDS,
+        DEFAULT_INTELLIGENCE_DURABILITY_SECONDS,
+        int_between(0, 86400),
+    ),
+    (CONF_OCCUPANCY_ENTITIES, DEFAULT_OCCUPANCY_ENTITIES, cv.entity_ids),
+    (CONF_PRESENCE_ENTITIES, DEFAULT_PRESENCE_ENTITIES, cv.entity_ids),
+    (CONF_ILLUMINANCE_ENTITIES, DEFAULT_ILLUMINANCE_ENTITIES, cv.entity_ids),
+    (
+        CONF_HOME_STATE_ENTITY,
+        DEFAULT_HOME_STATE_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (
+        CONF_SECURITY_STATE_ENTITY,
+        DEFAULT_SECURITY_STATE_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (CONF_SLEEP_ENTITY, DEFAULT_SLEEP_ENTITY, vol.Any(cv.entity_id, None)),
+    (CONF_MEDIA_ENTITIES, DEFAULT_MEDIA_ENTITIES, cv.entity_ids),
+    (
+        CONF_ENERGY_CONSTRAINT_ENTITY,
+        DEFAULT_ENERGY_CONSTRAINT_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (
+        CONF_MANUAL_HOLD_ENTITY,
+        DEFAULT_MANUAL_HOLD_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (
+        CONF_SEMANTIC_INTENT_ENTITY,
+        DEFAULT_SEMANTIC_INTENT_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (CONF_TASK_BRIGHTNESS_CAP, DEFAULT_TASK_BRIGHTNESS_CAP, int_between(1, 100)),
+    (CONF_AMBIENT_BRIGHTNESS_CAP, DEFAULT_AMBIENT_BRIGHTNESS_CAP, int_between(1, 100)),
+    (CONF_VIDEO_BRIGHTNESS_CAP, DEFAULT_VIDEO_BRIGHTNESS_CAP, int_between(1, 100)),
+    (CONF_NIGHT_BRIGHTNESS_CAP, DEFAULT_NIGHT_BRIGHTNESS_CAP, int_between(1, 100)),
+    (
+        CONF_PRELIGHT_BRIGHTNESS_CAP,
+        DEFAULT_PRELIGHT_BRIGHTNESS_CAP,
+        int_between(1, 100),
+    ),
 ]
 
 
@@ -453,7 +651,14 @@ _yaml_validation_tuples = [
 
 _DOMAIN_SCHEMA = vol.Schema(
     {
-        vol.Optional(key, default=replace_none_str(default, vol.UNDEFINED)): validation
+        vol.Optional(
+            key,
+            default=(
+                vol.UNDEFINED
+                if default is None
+                else replace_none_str(default, vol.UNDEFINED)
+            ),
+        ): validation
         for key, default, validation in _yaml_validation_tuples
     },
 )

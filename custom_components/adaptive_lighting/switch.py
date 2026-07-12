@@ -6,7 +6,9 @@ import asyncio
 import datetime
 import logging
 import zoneinfo
+from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import asdict, is_dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -91,33 +93,54 @@ from .const import (
     CONF_ADAPT_DELAY,
     CONF_ADAPT_ONLY_ON_BARE_TURN_ON,
     CONF_ADAPT_UNTIL_SLEEP,
+    CONF_AMBIENT_BRIGHTNESS_CAP,
     CONF_AUTORESET_CONTROL,
     CONF_BRIGHTNESS_MODE,
     CONF_BRIGHTNESS_MODE_TIME_DARK,
     CONF_BRIGHTNESS_MODE_TIME_LIGHT,
     CONF_DETECT_NON_HA_CHANGES,
+    CONF_ENERGY_CONSTRAINT_ENTITY,
+    CONF_HOME_STATE_ENTITY,
+    CONF_ILLUMINANCE_ENTITIES,
     CONF_INCLUDE_CONFIG_IN_ATTRIBUTES,
     CONF_INITIAL_TRANSITION,
+    CONF_INTELLIGENCE_AUTO_PROMOTE,
+    CONF_INTELLIGENCE_DURABILITY_SECONDS,
+    CONF_INTELLIGENCE_ENABLED,
+    CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
+    CONF_INTELLIGENCE_MINIMUM_SAMPLES,
+    CONF_INTELLIGENCE_SHADOW_MODE,
+    CONF_INTELLIGENCE_TRAINING_DAYS,
+    CONF_INTELLIGENCE_TRAINING_ENABLED,
     CONF_INTERCEPT,
     CONF_INTERVAL,
     CONF_LIGHTS,
     CONF_MANUAL_CONTROL,
+    CONF_MANUAL_HOLD_ENTITY,
     CONF_MAX_BRIGHTNESS,
     CONF_MAX_COLOR_TEMP,
     CONF_MAX_SUNRISE_TIME,
     CONF_MAX_SUNSET_TIME,
+    CONF_MEDIA_ENTITIES,
     CONF_MIN_BRIGHTNESS,
     CONF_MIN_COLOR_TEMP,
     CONF_MIN_SUNRISE_TIME,
     CONF_MIN_SUNSET_TIME,
     CONF_MULTI_LIGHT_INTERCEPT,
+    CONF_NIGHT_BRIGHTNESS_CAP,
+    CONF_OCCUPANCY_ENTITIES,
     CONF_ONLY_ONCE,
     CONF_PREFER_RGB_COLOR,
+    CONF_PRELIGHT_BRIGHTNESS_CAP,
+    CONF_PRESENCE_ENTITIES,
+    CONF_SECURITY_STATE_ENTITY,
+    CONF_SEMANTIC_INTENT_ENTITY,
     CONF_SEND_SPLIT_DELAY,
     CONF_SEPARATE_TURN_ON_COMMANDS,
     CONF_SKIP_REDUNDANT_COMMANDS,
     CONF_SLEEP_BRIGHTNESS,
     CONF_SLEEP_COLOR_TEMP,
+    CONF_SLEEP_ENTITY,
     CONF_SLEEP_RGB_COLOR,
     CONF_SLEEP_RGB_OR_COLOR_TEMP,
     CONF_SLEEP_TRANSITION,
@@ -127,17 +150,22 @@ from .const import (
     CONF_SUNSET_TIME,
     CONF_TAKE_OVER_CONTROL,
     CONF_TAKE_OVER_CONTROL_MODE,
+    CONF_TASK_BRIGHTNESS_CAP,
     CONF_TRANSITION,
     CONF_TURN_ON_LIGHTS,
     CONF_USE_DEFAULTS,
+    CONF_VIDEO_BRIGHTNESS_CAP,
     DOMAIN,
     EXTRA_VALIDATION,
     ICON_BRIGHTNESS,
     ICON_COLOR_TEMP,
     ICON_MAIN,
     ICON_SLEEP,
+    INTELLIGENCE_SERVICE_SCHEMA,
     SERVICE_APPLY,
     SERVICE_CHANGE_SWITCH_SETTINGS,
+    SERVICE_EXPLAIN,
+    SERVICE_PREVIEW,
     SERVICE_SET_MANUAL_CONTROL,
     SET_MANUAL_CONTROL_SCHEMA,
     SLEEP_MODE_SWITCH,
@@ -147,6 +175,14 @@ from .const import (
     apply_service_schema,
     replace_none_str,
 )
+from .context import ContextSignal, ContextSnapshot
+from .context_classification import (
+    MediaState,
+    SecurityState,
+    classify_media_state,
+    classify_security_state,
+)
+from .discovery import EntityDiscoveryCoordinator, InventorySnapshot
 from .hass_utils import area_entities, setup_service_call_interceptor
 from .helpers import (
     clamp,
@@ -155,6 +191,8 @@ from .helpers import (
     remove_vowels,
     short_hash,
 )
+from .policy import PolicyConfig, evaluate_policy
+from .training import AdaptiveLightingTraining
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Iterable
@@ -189,6 +227,206 @@ RGB_REDMEAN_CHANGE = 80  # ≈10% of total range
 
 # Keep a short domain version for the context instances (which can only be 36 chars)
 _DOMAIN_SHORT = "al"
+
+
+def _state_is_active(state: State | None) -> bool:
+    """Return a conservative boolean interpretation for context entities."""
+    if state is None:
+        return False
+    value = state.state.strip().lower()
+    return value in {
+        "on",
+        "active",
+        "home",
+        "occupied",
+        "present",
+        "playing",
+        "true",
+        "yes",
+        "1",
+    }
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert a policy result into Home Assistant state-attribute data."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        return _json_safe(enum_value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _evaluate_intelligence_policy(
+    snapshot_values: dict[str, Any],
+    policy_values: dict[str, Any],
+    intent_hint: str,
+) -> dict[str, Any] | None:
+    """Evaluate the pure policy through one explicit Home Assistant adapter.
+
+    This boundary is deliberately typed. If the pure API changes, evaluation
+    fails safe to the deterministic baseline instead of silently guessing a
+    constructor shape and producing a plausible but incorrect decision.
+    """
+    try:
+        raw_signals = snapshot_values["signals"]
+
+        def source_for(name: str) -> str:
+            for signal in raw_signals:
+                if signal["name"] == name:
+                    return signal["source"]
+            return "adaptive_lighting"
+
+        def make_signal(
+            name: str,
+            value: Any,
+            available: bool = True,
+        ) -> ContextSignal[Any]:
+            return ContextSignal(
+                value=value if available else None,
+                source=source_for(name),
+                available=available,
+                confidence=1.0 if available else 0.0,
+                detail=name,
+            )
+
+        def boolean_signal(name: str, key: str) -> ContextSignal[bool]:
+            available = bool(snapshot_values.get(f"{key}_available", False))
+            return make_signal(name, bool(snapshot_values.get(key)), available)
+
+        semantic = snapshot_values.get("semantic_intent") or ""
+        snapshot = ContextSnapshot(
+            emergency=make_signal(
+                "security_state_entity",
+                bool(snapshot_values.get("emergency")),
+                bool(snapshot_values.get("emergency_available", False)),
+            ),
+            manual=make_signal(
+                "manual_hold",
+                bool(snapshot_values.get("manual_control")),
+                bool(snapshot_values.get("manual_control")),
+            ),
+            manual_hold=make_signal(
+                "manual_hold",
+                bool(snapshot_values.get("manual_hold")),
+                bool(snapshot_values.get("manual_hold_available", False)),
+            ),
+            sleep=make_signal(
+                "sleep_entity",
+                bool(snapshot_values.get("sleep")),
+                bool(snapshot_values.get("sleep_available", False)),
+            ),
+            sleep_mode=make_signal(
+                "sleep_entity",
+                bool(snapshot_values.get("sleep")),
+                bool(snapshot_values.get("sleep_available", False)),
+            ),
+            night_path=make_signal(
+                "semantic_intent_entity",
+                intent_hint == "night",
+                "night" in semantic,
+            ),
+            task=make_signal(
+                "semantic_intent_entity",
+                intent_hint == "task",
+                any(token in semantic for token in ("task", "focus", "work")),
+            ),
+            video=make_signal(
+                "media_entities",
+                intent_hint == "video",
+                bool(snapshot_values.get("media_available", False))
+                or any(token in semantic for token in ("video", "movie", "cinema")),
+            ),
+            video_playing=make_signal(
+                "media_entities",
+                bool(snapshot_values.get("video_playing")),
+                bool(snapshot_values.get("media_available", False)),
+            ),
+            arrival=make_signal(
+                "semantic_intent_entity",
+                intent_hint == "prelight",
+                "prelight" in semantic,
+            ),
+            ambient=make_signal(
+                "semantic_intent_entity",
+                intent_hint == "ambient",
+                bool(snapshot_values.get("semantic_intent_available", False)),
+            ),
+            vacant=make_signal(
+                "occupancy_entities",
+                not bool(snapshot_values.get("occupancy")),
+                bool(snapshot_values.get("occupancy_available", False)),
+            ),
+            occupancy=boolean_signal("occupancy_entities", "occupancy"),
+            illuminance=make_signal(
+                "illuminance_entities",
+                snapshot_values.get("illuminance_value"),
+                bool(snapshot_values.get("illuminance_available", False)),
+            ),
+            requested_brightness=make_signal(
+                "adaptive_lighting",
+                policy_values["baseline_brightness_pct"],
+            ),
+            current_brightness=make_signal(
+                "adaptive_lighting",
+                policy_values["current_brightness_pct"],
+            ),
+            semantic_intent=make_signal(
+                "semantic_intent_entity",
+                semantic,
+                bool(snapshot_values.get("semantic_intent_available", False))
+                and bool(semantic),
+            ),
+            intent_hint=make_signal(
+                "adaptive_lighting",
+                intent_hint,
+                intent_hint != "adaptive",
+            ),
+        )
+        caps = policy_values
+        policy_config = PolicyConfig(
+            min_brightness=0.0,
+            max_brightness=caps["baseline_brightness_pct"],
+            emergency_brightness=caps["baseline_brightness_pct"],
+            task_brightness=caps["task"],
+            video_brightness=caps["video"],
+            arrival_brightness=caps["prelight"],
+            ambient_brightness=caps["ambient"],
+            vacant_brightness=0.0,
+            sleep_brightness=caps["night"],
+            sleep_max_brightness=caps["night"],
+            night_path_brightness=caps["night"],
+            night_path_max_brightness=caps["night"],
+        )
+        decision = evaluate_policy(snapshot, policy_config)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        _LOGGER.warning(
+            "Adaptive Lighting intelligence policy evaluation failed; "
+            "using the conservative runtime fallback",
+            exc_info=True,
+        )
+        return None
+
+    return {
+        "intent": _json_safe(decision.intent),
+        "target_brightness_pct": decision.brightness_target,
+        "confidence": decision.confidence,
+        "reason": " | ".join(decision.reasons),
+        # State attributes are recorder data. Keep only the bounded set of
+        # usable inputs instead of duplicating every unavailable schema field.
+        "provenance": _json_safe(
+            tuple(item for item in decision.input_provenance if item.available)[:12],
+        ),
+        "can_adjust": decision.can_adjust,
+        "can_turn_on": decision.can_turn_on,
+        "can_turn_off": decision.can_turn_off,
+    }
 
 
 def create_context(
@@ -520,6 +758,31 @@ async def async_setup_entry(  # noqa: PLR0915
                         force=True,
                     )
 
+    @callback
+    async def handle_intelligence_service(service_call: ServiceCall) -> None:
+        """Publish a read-only intelligence preview/explanation event."""
+        switches = _switches_from_service_call(hass, service_call)
+        lights = service_call.data[CONF_LIGHTS]
+        for switch in switches:
+            selected_lights = (
+                switch.lights
+                if not lights
+                else _expand_light_groups(
+                    hass,
+                    lights,
+                )
+            )
+            decisions = switch.preview_intelligence(selected_lights)
+            hass.bus.async_fire(
+                f"{DOMAIN}.intelligence_{service_call.service}",
+                {
+                    ATTR_ENTITY_ID: switch.entity_id,
+                    "decisions": decisions,
+                    "shadow_mode": switch._intelligence_shadow_actuation_blocked,
+                },
+                context=service_call.context,
+            )
+
     # Register `apply` service
     hass.services.async_register(
         domain=DOMAIN,
@@ -535,6 +798,14 @@ async def async_setup_entry(  # noqa: PLR0915
         service_func=handle_set_manual_control,
         schema=SET_MANUAL_CONTROL_SCHEMA,
     )
+
+    for service in (SERVICE_PREVIEW, SERVICE_EXPLAIN):
+        hass.services.async_register(
+            domain=DOMAIN,
+            service=service,
+            service_func=handle_intelligence_service,
+            schema=INTELLIGENCE_SERVICE_SCHEMA,
+        )
 
     args: VolDictType = {vol.Optional(CONF_USE_DEFAULTS, default="current"): cv.string}
     # Modifying these after init isn't possible
@@ -877,10 +1148,47 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
         # Set in self._update_attrs_and_maybe_adapt_lights
         self._settings: dict[str, Any] = {}
+        self._intelligence_decisions: dict[str, dict[str, Any]] = {}
+        self._discovery_snapshot: InventorySnapshot | None = None
+        self._discovered_context_entities: dict[str, list[str]] = {}
+        configured_context_ids = [
+            entity_id
+            for value in self._intelligence_entities.values()
+            for entity_id in (value if isinstance(value, list) else [value])
+            if entity_id
+        ]
+        self._discovery = (
+            EntityDiscoveryCoordinator(
+                hass,
+                seed_entity_ids=[*self.lights, *configured_context_ids],
+                explicit_controlled_entity_ids=self.lights,
+                on_change=self._async_discovery_changed,
+            )
+            if self._intelligence_enabled
+            else None
+        )
+        training_config = self._intelligence_training_config
+        self._training = (
+            AdaptiveLightingTraining(
+                hass,
+                storage_key=f"adaptive_lighting_training_{slugify(self._name)}",
+                training_duration_days=training_config["training_days"],
+                auto_promote=training_config["auto_promote"],
+                minimum_samples=training_config["minimum_samples"],
+                minimum_confidence=training_config["minimum_confidence"],
+                durability_seconds=training_config["durability_seconds"],
+                public_holiday_predicate=self._is_public_holiday,
+                on_change=self._async_training_changed,
+            )
+            if self._intelligence_enabled and training_config["enabled"]
+            else None
+        )
 
         # Set and unset tracker in async_turn_on and async_turn_off
         self.remove_listeners: list[CALLBACK_TYPE] = []
         self.remove_interval: CALLBACK_TYPE = lambda: None
+        self._remove_intelligence_context_listener: CALLBACK_TYPE = lambda: None
+        self._intelligence_context_refresh_task: asyncio.Task[None] | None = None
         _LOGGER.debug(
             "%s: Setting up with '%s',"
             " config_entry.data: '%s',"
@@ -918,6 +1226,36 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 elif isinstance(v, datetime.timedelta):
                     attrdata[k] = v.total_seconds()
             self._config.update(attrdata)
+
+        self._intelligence_enabled = data[CONF_INTELLIGENCE_ENABLED]
+        self._intelligence_shadow_mode = data[CONF_INTELLIGENCE_SHADOW_MODE]
+        self._intelligence_training_config = {
+            "enabled": data[CONF_INTELLIGENCE_TRAINING_ENABLED],
+            "training_days": data[CONF_INTELLIGENCE_TRAINING_DAYS],
+            "auto_promote": data[CONF_INTELLIGENCE_AUTO_PROMOTE],
+            "minimum_samples": data[CONF_INTELLIGENCE_MINIMUM_SAMPLES],
+            "minimum_confidence": data[CONF_INTELLIGENCE_MINIMUM_CONFIDENCE],
+            "durability_seconds": data[CONF_INTELLIGENCE_DURABILITY_SECONDS],
+        }
+        self._intelligence_entities = {
+            CONF_OCCUPANCY_ENTITIES: list(data[CONF_OCCUPANCY_ENTITIES]),
+            CONF_PRESENCE_ENTITIES: list(data[CONF_PRESENCE_ENTITIES]),
+            CONF_ILLUMINANCE_ENTITIES: list(data[CONF_ILLUMINANCE_ENTITIES]),
+            CONF_HOME_STATE_ENTITY: data[CONF_HOME_STATE_ENTITY],
+            CONF_SECURITY_STATE_ENTITY: data[CONF_SECURITY_STATE_ENTITY],
+            CONF_SLEEP_ENTITY: data[CONF_SLEEP_ENTITY],
+            CONF_MEDIA_ENTITIES: list(data[CONF_MEDIA_ENTITIES]),
+            CONF_ENERGY_CONSTRAINT_ENTITY: data[CONF_ENERGY_CONSTRAINT_ENTITY],
+            CONF_MANUAL_HOLD_ENTITY: data[CONF_MANUAL_HOLD_ENTITY],
+            CONF_SEMANTIC_INTENT_ENTITY: data[CONF_SEMANTIC_INTENT_ENTITY],
+        }
+        self._intelligence_caps = {
+            "task": data[CONF_TASK_BRIGHTNESS_CAP],
+            "ambient": data[CONF_AMBIENT_BRIGHTNESS_CAP],
+            "video": data[CONF_VIDEO_BRIGHTNESS_CAP],
+            "night": data[CONF_NIGHT_BRIGHTNESS_CAP],
+            "prelight": data[CONF_PRELIGHT_BRIGHTNESS_CAP],
+        }
 
         self.initial_transition = data[CONF_INITIAL_TRANSITION]
         self._sleep_transition = data[CONF_SLEEP_TRANSITION]
@@ -1016,8 +1354,145 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             entry_type=DeviceEntryType.SERVICE,
         )
 
+    async def _async_discovery_changed(self, snapshot: InventorySnapshot) -> None:
+        """Reconcile area/entity changes into observation-only context inputs."""
+        self._discovery_snapshot = snapshot
+        capability_map = {
+            CONF_OCCUPANCY_ENTITIES: {"motion", "occupancy"},
+            CONF_PRESENCE_ENTITIES: {"presence", "household_presence"},
+            CONF_ILLUMINANCE_ENTITIES: {"illuminance"},
+            CONF_MEDIA_ENTITIES: {"media"},
+            "openings": {"opening", "door", "window", "garage_door"},
+            "weather": {"weather", "daylight_proxy"},
+            "holidays": {"holiday_calendar"},
+            "arrivals": {"arrival"},
+            "security": {"security"},
+        }
+        self._discovered_context_entities = {
+            name: sorted(
+                item.entity_id
+                for item in snapshot.entities
+                if item.available and capabilities.intersection(item.capabilities)
+            )
+            for name, capabilities in capability_map.items()
+        }
+        if self.is_on:
+            self._setup_intelligence_context_listener()
+        if (
+            self.hass.is_running
+            and self.entity_id
+            and self.hass.states.get(self.entity_id)
+        ):
+            self.async_write_ha_state()
+
+    def _is_public_holiday(self, _: datetime.date) -> bool:
+        """Resolve today's holiday from configured/auto-discovered local entities."""
+        return any(
+            _state_is_active(self.hass.states.get(entity_id))
+            for entity_id in self._discovered_context_entities.get("holidays", [])
+        )
+
+    async def _async_training_changed(self, _: dict[str, Any]) -> None:
+        """Publish phase/sample changes without granting a new actuation path."""
+        if (
+            self.hass.is_running
+            and self.entity_id
+            and self.hass.states.get(self.entity_id)
+        ):
+            self.async_write_ha_state()
+
+    def _intelligence_entity_ids(self, name: str) -> list[str]:
+        """Merge configured entities with live discovery without duplicates."""
+        configured = self._intelligence_entities.get(name, [])
+        configured_ids = configured if isinstance(configured, list) else [configured]
+        return list(
+            dict.fromkeys(
+                entity_id
+                for entity_id in (
+                    *configured_ids,
+                    *self._discovered_context_entities.get(name, []),
+                )
+                if entity_id
+            ),
+        )
+
+    def _intelligence_single_entity(
+        self,
+        name: str,
+        discovered_group: str,
+    ) -> str | None:
+        """Prefer explicit singleton context, then one available discovery result."""
+        configured = self._intelligence_entities.get(name)
+        if isinstance(configured, str) and configured:
+            return configured
+        return next(
+            iter(self._discovered_context_entities.get(discovered_group, [])),
+            None,
+        )
+
+    def _setup_intelligence_context_listener(self) -> None:
+        """Track configured/discovered context and replace stale registry targets."""
+        self._remove_intelligence_context_listener()
+        if not self._intelligence_enabled:
+            self._remove_intelligence_context_listener = lambda: None
+            return
+        entity_ids = sorted(
+            {
+                entity_id
+                for value in self._intelligence_entities.values()
+                for entity_id in (value if isinstance(value, list) else [value])
+                if entity_id
+            }
+            | {
+                entity_id
+                for entity_ids in self._discovered_context_entities.values()
+                for entity_id in entity_ids
+            },
+        )
+        self._remove_intelligence_context_listener = (
+            async_track_state_change_event(
+                self.hass,
+                entity_ids,
+                self._schedule_intelligence_context_refresh,
+            )
+            if entity_ids
+            else lambda: None
+        )
+
+    @callback
+    def _schedule_intelligence_context_refresh(
+        self,
+        _: EventStateChangedData,
+    ) -> None:
+        """Coalesce noisy sensor bursts while keeping alarms responsive."""
+        if not self.is_on or (
+            self._intelligence_context_refresh_task is not None
+            and not self._intelligence_context_refresh_task.done()
+        ):
+            return
+        self._intelligence_context_refresh_task = self.hass.async_create_task(
+            self._async_refresh_from_context(),
+            name=f"adaptive_lighting_context_{slugify(self._name)}",
+        )
+
+    async def _async_refresh_from_context(self) -> None:
+        """Re-evaluate a settled context snapshot through normal safety gates."""
+        try:
+            await asyncio.sleep(0.25)
+            if self.is_on:
+                await self._update_attrs_and_maybe_adapt_lights(
+                    context=self.create_context("intelligence_context"),
+                    transition=self._transition,
+                )
+        finally:
+            self._intelligence_context_refresh_task = None
+
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to hass."""
+        if self._discovery is not None:
+            await self._discovery.async_start()
+        if self._training is not None:
+            await self._training.async_setup()
         if self.hass.is_running:
             await self._setup_listeners()
         else:
@@ -1036,6 +1511,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Remove the listeners upon removing the component."""
         self._remove_listeners()
+        if self._discovery is not None:
+            await self._discovery.async_stop()
+        if self._training is not None:
+            await self._training.async_unload()
 
     def _expand_light_groups(self, hass: HomeAssistant | None = None) -> None:
         hass = hass or self.hass
@@ -1065,6 +1544,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
         self.remove_listeners.append(remove_sleep)
         self._expand_light_groups()
+        self._setup_intelligence_context_listener()
 
     def _update_time_interval_listener(self) -> None:
         """Create or recreate the adaptation interval listener.
@@ -1115,10 +1595,448 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     def _remove_listeners(self) -> None:
         self._remove_interval_listener()
+        self._remove_intelligence_context_listener()
+        self._remove_intelligence_context_listener = lambda: None
+        if (
+            self._intelligence_context_refresh_task is not None
+            and not self._intelligence_context_refresh_task.done()
+        ):
+            self._intelligence_context_refresh_task.cancel()
+        self._intelligence_context_refresh_task = None
 
         while self.remove_listeners:
             remove_listener = self.remove_listeners.pop()
             remove_listener()
+
+    @property
+    def _intelligence_shadow_actuation_blocked(self) -> bool:
+        """Return whether intelligence shadow mode must suppress all AL calls."""
+        if not self._intelligence_enabled:
+            return False
+        if self._training is not None and not self._training.is_active:
+            return True
+        auto_promoted = (
+            self._training is not None
+            and self._training.is_active
+            and self._intelligence_training_config["auto_promote"]
+        )
+        return self._intelligence_shadow_mode and not auto_promoted
+
+    def _intelligence_snapshot(self) -> dict[str, Any]:
+        """Build a serializable snapshot for the optional pure policy engine."""
+        signals: list[dict[str, Any]] = []
+
+        def add_signal(kind: str, entity_id: str | None) -> State | None:
+            if not entity_id:
+                return None
+            state = self.hass.states.get(entity_id)
+            signals.append(
+                {
+                    "name": kind,
+                    "kind": kind,
+                    "entity_id": entity_id,
+                    "source": entity_id,
+                    "state": state.state if state is not None else None,
+                    "value": state.state if state is not None else None,
+                    "confidence": 1.0 if state is not None else 0.0,
+                },
+            )
+            return state
+
+        def add_signals(kind: str, entity_ids: list[str]) -> list[State]:
+            return [
+                state
+                for entity_id in entity_ids
+                if (state := add_signal(kind, entity_id)) is not None
+            ]
+
+        occupancy_states = add_signals(
+            CONF_OCCUPANCY_ENTITIES,
+            self._intelligence_entity_ids(CONF_OCCUPANCY_ENTITIES),
+        )
+        presence_states = add_signals(
+            CONF_PRESENCE_ENTITIES,
+            self._intelligence_entity_ids(CONF_PRESENCE_ENTITIES),
+        )
+        illuminance_states = add_signals(
+            CONF_ILLUMINANCE_ENTITIES,
+            self._intelligence_entity_ids(CONF_ILLUMINANCE_ENTITIES),
+        )
+        media_states = add_signals(
+            CONF_MEDIA_ENTITIES,
+            self._intelligence_entity_ids(CONF_MEDIA_ENTITIES),
+        )
+        discovered_single_groups = {
+            CONF_HOME_STATE_ENTITY: CONF_PRESENCE_ENTITIES,
+            CONF_SECURITY_STATE_ENTITY: "security",
+            CONF_SLEEP_ENTITY: "sleep",
+            CONF_ENERGY_CONSTRAINT_ENTITY: "weather",
+            CONF_MANUAL_HOLD_ENTITY: "manual_hold",
+            CONF_SEMANTIC_INTENT_ENTITY: "semantic_intent",
+        }
+        single_states = {
+            name: add_signal(
+                name,
+                self._intelligence_single_entity(
+                    name,
+                    discovered_single_groups[name],
+                ),
+            )
+            for name in (
+                CONF_HOME_STATE_ENTITY,
+                CONF_SECURITY_STATE_ENTITY,
+                CONF_SLEEP_ENTITY,
+                CONF_ENERGY_CONSTRAINT_ENTITY,
+                CONF_MANUAL_HOLD_ENTITY,
+                CONF_SEMANTIC_INTENT_ENTITY,
+            )
+        }
+        semantic_state = single_states[CONF_SEMANTIC_INTENT_ENTITY]
+        semantic_intent = (
+            semantic_state.state.lower() if semantic_state is not None else None
+        )
+        media_playing = any(_state_is_active(state) for state in media_states)
+        media_categories = [
+            classify_media_state(
+                {
+                    "state": state.state,
+                    "attributes": state.attributes,
+                    "entity_id": state.entity_id,
+                },
+            ).category
+            for state in media_states
+            if _state_is_active(state)
+        ]
+        # Explicit helper entity names are an adapter-level contract. A binary
+        # sensor named ``*_video_content_playing`` carries stronger meaning than
+        # a generic media_player whose app/content metadata is absent.
+        if any(
+            _state_is_active(state) and "video" in state.entity_id
+            for state in media_states
+        ):
+            media_categories.insert(0, MediaState.VIDEO)
+        media_category = next(
+            (
+                category
+                for category in (
+                    MediaState.MOVIE,
+                    MediaState.TV,
+                    MediaState.VIDEO,
+                    MediaState.GAME,
+                    MediaState.PODCAST,
+                    MediaState.MUSIC,
+                    MediaState.AUDIO,
+                )
+                if category in media_categories
+            ),
+            MediaState.UNKNOWN,
+        )
+        security_state = single_states[CONF_SECURITY_STATE_ENTITY]
+        security = classify_security_state(
+            {
+                "state": security_state.state if security_state is not None else None,
+                "attributes": security_state.attributes
+                if security_state is not None
+                else {},
+                "entity_id": security_state.entity_id
+                if security_state is not None
+                else None,
+            },
+        )
+        sleep_active = _state_is_active(single_states[CONF_SLEEP_ENTITY])
+        manual_hold = _state_is_active(single_states[CONF_MANUAL_HOLD_ENTITY])
+
+        intent_hint = "adaptive"
+        semantic_value = semantic_intent or ""
+        if security.category is SecurityState.EMERGENCY:
+            intent_hint = "emergency"
+        elif sleep_active or any(
+            token in semantic_value for token in ("night", "sleep")
+        ):
+            intent_hint = "sleep"
+        elif any(token in semantic_value for token in ("video", "movie", "cinema")):
+            intent_hint = "video"
+        elif any(token in semantic_value for token in ("task", "focus", "work")):
+            intent_hint = "task"
+        elif any(token in semantic_value for token in ("ambient", "relax", "chill")):
+            intent_hint = "ambient"
+        elif "prelight" in semantic_value:
+            intent_hint = "prelight"
+        elif media_category in {MediaState.MOVIE, MediaState.TV, MediaState.VIDEO}:
+            intent_hint = "video"
+        elif media_category is MediaState.GAME:
+            intent_hint = "task"
+        elif media_category in {
+            MediaState.PODCAST,
+            MediaState.MUSIC,
+            MediaState.AUDIO,
+        }:
+            intent_hint = "ambient"
+
+        illuminance_value: float | None = None
+        for state in illuminance_states:
+            try:
+                illuminance_value = float(state.state)
+            except ValueError:
+                continue
+            break
+
+        return {
+            "signals": signals,
+            "occupancy": any(
+                _state_is_active(state)
+                for state in (*occupancy_states, *presence_states)
+            ),
+            "occupancy_available": bool(occupancy_states or presence_states),
+            "presence": any(_state_is_active(state) for state in presence_states),
+            "presence_available": bool(presence_states),
+            "illuminance": [state.state for state in illuminance_states],
+            "illuminance_value": illuminance_value,
+            "illuminance_available": illuminance_value is not None,
+            "home_state": single_states[CONF_HOME_STATE_ENTITY].state
+            if single_states[CONF_HOME_STATE_ENTITY] is not None
+            else None,
+            "security_state": single_states[CONF_SECURITY_STATE_ENTITY].state
+            if single_states[CONF_SECURITY_STATE_ENTITY] is not None
+            else None,
+            "sleep": sleep_active,
+            "sleep_available": single_states[CONF_SLEEP_ENTITY] is not None,
+            "emergency": security.category is SecurityState.EMERGENCY,
+            "emergency_available": security.is_known,
+            "media_playing": media_playing,
+            "video_playing": media_category
+            in {MediaState.MOVIE, MediaState.TV, MediaState.VIDEO},
+            "media_available": bool(media_states),
+            "media_category": media_category.value,
+            "energy_constraint": single_states[CONF_ENERGY_CONSTRAINT_ENTITY].state
+            if single_states[CONF_ENERGY_CONSTRAINT_ENTITY] is not None
+            else None,
+            "manual_hold": manual_hold,
+            "manual_hold_available": single_states[CONF_MANUAL_HOLD_ENTITY] is not None,
+            "semantic_intent": semantic_intent,
+            "semantic_intent_available": semantic_state is not None,
+            "intent_hint": intent_hint,
+        }
+
+    def _fallback_intelligence_decision(
+        self,
+        light: str,
+        baseline_brightness_pct: int,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a conservative policy result when the pure engine is absent."""
+        light_on = is_on(self.hass, light)
+        manually_controlled = self.manager.get_manual_control_attributes(
+            light,
+        ).has_any()
+        manual_hold = snapshot["manual_hold"] or manually_controlled
+        intent = snapshot["intent_hint"]
+        signals = [signal["entity_id"] for signal in snapshot["signals"]]
+        provenance = {
+            "adapter": "runtime_fallback",
+            "signals": signals,
+            "manual_control": manually_controlled,
+        }
+
+        if not light_on:
+            return {
+                "intent": intent,
+                "baseline_brightness_pct": baseline_brightness_pct,
+                "target_brightness_pct": baseline_brightness_pct,
+                "confidence": 1.0,
+                "reason": "light_not_already_on; automatic turn-on is not implemented",
+                "provenance": provenance,
+                "can_adjust": False,
+                "can_turn_on": False,
+                "can_turn_off": False,
+                "overridden": False,
+            }
+        if manual_hold:
+            return {
+                "intent": "manual_hold",
+                "baseline_brightness_pct": baseline_brightness_pct,
+                "target_brightness_pct": baseline_brightness_pct,
+                "confidence": 1.0,
+                "reason": "manual hold or existing Adaptive Lighting takeover is authoritative",
+                "provenance": provenance,
+                "can_adjust": False,
+                "can_turn_on": False,
+                "can_turn_off": False,
+                "overridden": False,
+            }
+
+        return {
+            "intent": intent,
+            "baseline_brightness_pct": baseline_brightness_pct,
+            "target_brightness_pct": baseline_brightness_pct,
+            "confidence": 0.0,
+            "reason": "policy unavailable; preserving deterministic baseline",
+            "provenance": provenance,
+            "can_adjust": False,
+            "can_turn_on": False,
+            "can_turn_off": False,
+            "overridden": False,
+        }
+
+    def _intelligence_decision(
+        self,
+        light: str,
+        baseline_brightness_pct: int,
+    ) -> dict[str, Any]:
+        """Evaluate one light while preserving manual and turn-on safety boundaries."""
+        snapshot = self._intelligence_snapshot()
+        snapshot["manual_control"] = self.manager.get_manual_control_attributes(
+            light,
+        ).has_any()
+        fallback = self._fallback_intelligence_decision(
+            light,
+            baseline_brightness_pct,
+            snapshot,
+        )
+        if not self._intelligence_enabled:
+            return fallback
+
+        light_state = self.hass.states.get(light)
+        current_brightness = (
+            round(100 * light_state.attributes[ATTR_BRIGHTNESS] / 255)
+            if light_state is not None
+            and isinstance(light_state.attributes.get(ATTR_BRIGHTNESS), (int, float))
+            else baseline_brightness_pct
+        )
+        policy_values = {
+            **self._intelligence_caps,
+            "baseline_brightness_pct": baseline_brightness_pct,
+            "current_brightness_pct": current_brightness,
+            "light_on": is_on(self.hass, light),
+            "manual_hold": snapshot["manual_hold"],
+        }
+        external = _evaluate_intelligence_policy(
+            snapshot,
+            policy_values,
+            snapshot["intent_hint"],
+        )
+        if not external:
+            return fallback
+
+        decision = dict(fallback)
+        decision["intent"] = _json_safe(external.get("intent", fallback["intent"]))
+        decision["confidence"] = float(
+            external.get("confidence", fallback["confidence"]),
+        )
+        decision["reason"] = str(external.get("reason", fallback["reason"]))
+        decision["provenance"] = _json_safe(
+            external.get("provenance", fallback["provenance"]),
+        )
+        for permission in ("can_adjust", "can_turn_on", "can_turn_off"):
+            decision[permission] = bool(external.get(permission, False))
+        target = external.get(
+            "target_brightness_pct",
+            external.get("target_brightness", fallback["target_brightness_pct"]),
+        )
+        if (
+            self._training is not None
+            and self._training.is_active
+            and decision["can_adjust"]
+        ):
+            time_bucket, daylight_band = self._intelligence_learning_dimensions(
+                snapshot,
+            )
+            preference = self._training.preference_for(
+                baseline=float(target),
+                zone=self._name,
+                intent=str(decision["intent"]),
+                time_bucket=time_bucket,
+                daylight_band=daylight_band,
+            )
+            qualified = (
+                preference["samples"] >= 2
+                and preference["confidence"]
+                >= self._intelligence_training_config["minimum_confidence"]
+            )
+            decision["learning"] = {**preference, "qualified": qualified}
+            if qualified:
+                target = preference["target"]
+                decision["reason"] += (
+                    f" | learned {preference['offset']:+g}% from "
+                    f"{preference['samples']} matching human samples"
+                )
+        try:
+            # Keep active intelligence adjustment-only. Some integrations
+            # interpret brightness=0 as a power-off command.
+            target = max(1, min(baseline_brightness_pct, round(float(target))))
+        except (TypeError, ValueError):
+            target = fallback["target_brightness_pct"]
+        if (
+            not decision["can_adjust"]
+            or not is_on(self.hass, light)
+            or snapshot["manual_hold"]
+        ):
+            if decision["intent"] not in {"manual", "manual_hold"}:
+                target = baseline_brightness_pct
+            decision["reason"] = (
+                "policy did not authorize adjustment; preserving baseline"
+                if not decision["can_adjust"]
+                else "light_not_already_on; automatic turn-on is not implemented"
+                if not is_on(self.hass, light)
+                else "manual hold is authoritative"
+            )
+        decision["target_brightness_pct"] = target
+        decision["overridden"] = target != baseline_brightness_pct
+        return decision
+
+    def _refresh_intelligence_decisions(self) -> None:
+        """Refresh exposed decisions without causing any light service call."""
+        if not self._intelligence_enabled:
+            self._intelligence_decisions.clear()
+            return
+        baseline = self._intelligence_baseline_brightness()
+        self._intelligence_decisions = {
+            light: self._intelligence_decision(light, baseline) for light in self.lights
+        }
+
+    def _intelligence_baseline_brightness(self) -> int:
+        """Return a current sun baseline even when the restored switch is off."""
+        if "brightness_pct" in self._settings:
+            return round(self._settings["brightness_pct"])
+        settings = self._sun_light_settings.get_settings(
+            self.sleep_mode_switch.is_on,
+            transition=0,
+        )
+        return round(settings["brightness_pct"])
+
+    def preview_intelligence(self, lights: list[str] | None = None) -> dict[str, Any]:
+        """Return read-only policy results for a service preview/explain request."""
+        if not self._intelligence_enabled:
+            return {}
+        baseline = self._intelligence_baseline_brightness()
+        selected_lights = lights or self.lights
+        decisions = {
+            light: self._intelligence_decision(light, baseline)
+            for light in selected_lights
+        }
+        self._intelligence_decisions.update(decisions)
+        return deepcopy(decisions)
+
+    def _intelligence_target_brightness(
+        self,
+        light: str,
+        baseline_brightness_pct: int,
+    ) -> int | None:
+        """Return an authorized active-mode adjustment, or no brightness call."""
+        if not self._intelligence_enabled:
+            return baseline_brightness_pct
+        if self._intelligence_shadow_actuation_blocked:
+            return None
+        decision = self._intelligence_decision(light, baseline_brightness_pct)
+        self._intelligence_decisions[light] = decision
+        permitted = (
+            decision["can_adjust"]
+            if is_on(self.hass, light)
+            else decision["can_turn_on"]
+        )
+        if not permitted:
+            return None
+        return int(decision["target_brightness_pct"])
 
     @property
     def icon(self) -> str:
@@ -1137,6 +2055,40 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             light for light in self.lights if self.manager.manual_control.get(light)
         ]
         extra_state_attributes.update(self._settings)
+        if self._intelligence_enabled:
+            decisions = self._intelligence_decisions
+            extra_state_attributes["intelligence"] = {
+                "enabled": True,
+                "configured_shadow_mode": self._intelligence_shadow_mode,
+                "shadow_mode": self._intelligence_shadow_actuation_blocked,
+            }
+            extra_state_attributes["intelligence_decisions"] = deepcopy(decisions)
+            if self._training is not None:
+                extra_state_attributes["intelligence_training"] = (
+                    self._training.summary()
+                )
+            if self._discovery_snapshot is not None:
+                snapshot = self._discovery_snapshot
+                extra_state_attributes["intelligence_discovery"] = {
+                    "revision": snapshot.revision,
+                    "reason": snapshot.reason,
+                    "areas": list(snapshot.monitored_area_ids),
+                    "entity_count": len(snapshot.entities),
+                    "entities": [
+                        {
+                            "entity_id": item.entity_id,
+                            "area": item.area_name or item.area_id,
+                            "capabilities": list(item.capabilities),
+                            "status": item.status,
+                            "explicit_controlled": item.explicit_controlled,
+                        }
+                        for item in snapshot.entities[:100]
+                    ],
+                    "added": [item.entity_id for item in snapshot.added],
+                    "removed": [item.entity_id for item in snapshot.removed],
+                    "moved": [item.to_dict() for item in snapshot.moved],
+                    "truncated": len(snapshot.entities) > 100,
+                }
         timers = self.manager.auto_reset_manual_control_timers
         extra_state_attributes["autoreset_time_remaining"] = {
             light: time
@@ -1248,8 +2200,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             service_data[ATTR_TRANSITION] = transition
 
         if "brightness" in features and adapt_brightness:
-            brightness = round(255 * self._settings["brightness_pct"] / 100)
-            service_data[ATTR_BRIGHTNESS] = brightness
+            brightness_pct = self._intelligence_target_brightness(
+                light,
+                round(self._settings["brightness_pct"]),
+            )
+            if brightness_pct is not None:
+                brightness = round(255 * brightness_pct / 100)
+                service_data[ATTR_BRIGHTNESS] = brightness
 
         sleep_rgb = (
             self.sleep_mode_switch.is_on
@@ -1310,6 +2267,26 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         prefer_rgb_color: bool | None = None,
         force: bool = False,
     ) -> None:
+        if self._intelligence_shadow_actuation_blocked:
+            # A commissioned shadow instance may calculate and expose policy
+            # decisions, but it must never issue an Adaptive Lighting light call.
+            return
+        if (
+            self._intelligence_enabled
+            and not self._intelligence_shadow_actuation_blocked
+        ):
+            snapshot = self._intelligence_snapshot()
+            if snapshot["manual_hold"]:
+                # An external/manual helper is a whole-light hold. Attribute-
+                # level Adaptive Lighting takeover remains enforced below by
+                # the existing manager machinery.
+                return
+            if not is_on(self.hass, light):
+                baseline = self._intelligence_baseline_brightness()
+                decision = self._intelligence_decision(light, baseline)
+                self._intelligence_decisions[light] = decision
+                if not decision["can_turn_on"]:
+                    return
         if (lock := self.manager.turn_off_locks.get(light)) and lock.locked():
             _LOGGER.debug("%s: '%s' is locked", self._name, light)
             return
@@ -1330,6 +2307,8 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     async def _execute_adaptation_calls(self, data: AdaptationData) -> None:
         """Executes a sequence of adaptation service calls for the given service datas."""
+        if self._intelligence_shadow_actuation_blocked:
+            return
         for index in range(data.max_length):
             is_first_call = index == 0
 
@@ -1436,6 +2415,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 transition,
             ),
         )
+        # Shadow mode deliberately refreshes both the existing sun baseline and
+        # the intelligence decision before writing state, but the actuation gate
+        # below prevents every Adaptive Lighting-originated light service call.
+        self._refresh_intelligence_decisions()
         self.async_write_ha_state()
 
         if not force and self._only_once:
@@ -1619,6 +2602,95 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             },
             context=context,
         )
+        self._schedule_training_sample(light, context, manual_attributes)
+
+    def _schedule_training_sample(
+        self,
+        light: str,
+        context: Context,
+        manual_attributes: LightControlAttributes,
+    ) -> None:
+        """Offer a durable, attributable brightness correction to local training."""
+        if (
+            self._training is None
+            or not manual_attributes & LightControlAttributes.BRIGHTNESS
+        ):
+            return
+        state = self.hass.states.get(light)
+        brightness = (
+            state.attributes.get(ATTR_BRIGHTNESS) if state is not None else None
+        )
+        if not isinstance(brightness, (int, float)):
+            return
+        selected = round(100 * brightness / 255)
+        snapshot = self._intelligence_snapshot()
+        current_decision = self._intelligence_decisions.get(light, {})
+        baseline = current_decision.get(
+            "target_brightness_pct",
+            self._intelligence_baseline_brightness(),
+        )
+        intent = current_decision.get(
+            "intent",
+            snapshot["intent_hint"],
+        )
+        time_bucket, daylight_band = self._intelligence_learning_dimensions(snapshot)
+        source = (
+            "user"
+            if context.user_id is not None
+            else "automation"
+            if context.parent_id is not None
+            else "physical"
+        )
+        self.hass.async_create_task(
+            self._training.async_ingest_sample(
+                {
+                    "zone": self._name,
+                    "baseline": baseline,
+                    "selected": selected,
+                    "source": source,
+                    "intent": intent,
+                    "time_bucket": time_bucket,
+                    "daylight_band": daylight_band,
+                    "safety_context": bool(
+                        snapshot.get("emergency") or snapshot.get("sleep"),
+                    ),
+                    "hard_cap": bool(
+                        snapshot.get("emergency") or snapshot.get("sleep"),
+                    ),
+                    "observed_at": dt_util.utcnow().isoformat(),
+                    "metadata": {
+                        "context_has_parent": context.parent_id is not None,
+                        "context_has_user": context.user_id is not None,
+                    },
+                },
+            ),
+            name=f"adaptive_lighting_training_{slugify(self._name)}",
+        )
+
+    @staticmethod
+    def _intelligence_learning_dimensions(snapshot: dict[str, Any]) -> tuple[str, str]:
+        """Return coarse, privacy-preserving temporal and daylight buckets."""
+        hour = dt_util.as_local(dt_util.utcnow()).hour
+        time_bucket = (
+            "morning"
+            if 5 <= hour < 12
+            else "day"
+            if 12 <= hour < 17
+            else "evening"
+            if 17 <= hour < 23
+            else "night"
+        )
+        illuminance = snapshot.get("illuminance_value")
+        daylight_band = (
+            "unknown"
+            if not isinstance(illuminance, (int, float))
+            else "dark"
+            if illuminance < 30
+            else "dim"
+            if illuminance < 150
+            else "bright"
+        )
+        return time_bucket, daylight_band
 
 
 class SimpleSwitch(SwitchEntity, RestoreEntity):
@@ -1696,8 +2768,8 @@ class SimpleSwitch(SwitchEntity, RestoreEntity):
         self._state = False
 
 
-type AdaptiveSwitches = list[AdaptiveSwitch]
-type AdaptiveSwitchMap = dict[AdaptiveSwitch, list[str]]
+AdaptiveSwitches = list[AdaptiveSwitch]
+AdaptiveSwitchMap = dict[AdaptiveSwitch, list[str]]
 
 
 class AdaptiveLightingManager:
@@ -1860,6 +2932,7 @@ class AdaptiveLightingManager:
                 if (
                     not switch.is_on
                     or not switch._intercept
+                    or switch._intelligence_shadow_actuation_blocked
                     # Never adapt on light groups, because HA will make a separate light.turn_on
                     or ((e := self.hass.states.get(entity_id)) and _is_light_group(e))
                     # Prevent adaptation of TURN_ON calls when light is already on,
@@ -2088,6 +3161,8 @@ class AdaptiveLightingManager:
             data,
             call.context.id,
         )
+        if switch._intelligence_shadow_actuation_blocked:
+            return
 
         # Reset because turning on the light, this also happens in
         # `state_changed_event_listener`, however, this function is called

@@ -36,12 +36,26 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_BRIGHTNESS_MODE_TIME_LIGHT,
     CONF_DETECT_NON_HA_CHANGES,
     CONF_INITIAL_TRANSITION,
+    CONF_INTELLIGENCE_AUTO_PROMOTE,
+    CONF_INTELLIGENCE_DURABILITY_SECONDS,
+    CONF_INTELLIGENCE_ENABLED,
+    CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
+    CONF_INTELLIGENCE_MINIMUM_SAMPLES,
+    CONF_INTELLIGENCE_SHADOW_MODE,
+    CONF_INTELLIGENCE_TRAINING_DAYS,
+    CONF_INTELLIGENCE_TRAINING_ENABLED,
     CONF_MANUAL_CONTROL,
+    CONF_MANUAL_HOLD_ENTITY,
     CONF_MAX_BRIGHTNESS,
+    CONF_MEDIA_ENTITIES,
     CONF_MIN_COLOR_TEMP,
     CONF_MULTI_LIGHT_INTERCEPT,
+    CONF_NIGHT_BRIGHTNESS_CAP,
     CONF_PREFER_RGB_COLOR,
+    CONF_SECURITY_STATE_ENTITY,
+    CONF_SEMANTIC_INTENT_ENTITY,
     CONF_SEPARATE_TURN_ON_COMMANDS,
+    CONF_SLEEP_ENTITY,
     CONF_SLEEP_RGB_OR_COLOR_TEMP,
     CONF_SUNRISE_OFFSET,
     CONF_SUNRISE_TIME,
@@ -51,6 +65,7 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_TRANSITION,
     CONF_TURN_ON_LIGHTS,
     CONF_USE_DEFAULTS,
+    CONF_VIDEO_BRIGHTNESS_CAP,
     DEFAULT_MAX_BRIGHTNESS,
     DEFAULT_NAME,
     DEFAULT_SLEEP_BRIGHTNESS,
@@ -59,6 +74,7 @@ from homeassistant.components.adaptive_lighting.const import (
     DOMAIN,
     SERVICE_APPLY,
     SERVICE_CHANGE_SWITCH_SETTINGS,
+    SERVICE_PREVIEW,
     SERVICE_SET_MANUAL_CONTROL,
     SLEEP_MODE_SWITCH,
     UNDO_UPDATE_LISTENER,
@@ -101,7 +117,9 @@ from homeassistant.components.template import light as template_light
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     ATTR_AREA_ID,
+    ATTR_DOMAIN,
     ATTR_ENTITY_ID,
+    ATTR_SERVICE,
     ATTR_SUPPORTED_FEATURES,
     CONF_LIGHTS,
     CONF_NAME,
@@ -418,15 +436,51 @@ async def test_adaptive_lighting_switches(hass):
     assert len(data.keys()) == 5
 
 
+async def test_shadow_intelligence_skips_initial_and_reactivation_light_calls(hass):
+    """Shadow intelligence must never actuate during switch lifecycle setup."""
+    await setup_lights(hass)
+
+    service_calls = []
+    remove_listener = hass.bus.async_listen(
+        EVENT_CALL_SERVICE,
+        service_calls.append,
+    )
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1, ENTITY_LIGHT_2],
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_TRANSITION: 0,
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+    await hass.async_block_till_done()
+
+    await switch.async_turn_off()
+    await switch.async_turn_on()
+    await hass.async_block_till_done()
+    remove_listener()
+
+    light_turn_on_calls = [
+        event
+        for event in service_calls
+        if event.data.get("domain") == LIGHT_DOMAIN
+        and event.data.get("service") == SERVICE_TURN_ON
+    ]
+    assert not light_turn_on_calls
+    assert switch._intelligence_decisions
+
+
 def async_process_ha_core_config(hass, config):
     """Set up the Home Assistant configuration."""
     try:
         # ha >= "2023.11.0"
-        from homeassistant.core_config import async_process_ha_core_config
+        from homeassistant.core_config import async_process_ha_core_config  # noqa: I001, PLC0415
 
         return async_process_ha_core_config(hass, config)
     except ModuleNotFoundError:
-        import homeassistant.config as config_util
+        import homeassistant.config as config_util  # noqa: PLC0415
 
         return config_util.async_process_ha_core_config(hass, config)
 
@@ -753,9 +807,9 @@ async def test_manual_control(
     # - With adapt_only_on_bare_turn_on=True: SHOULD mark as manually controlled (to preserve scenes)
     # - With adapt_only_on_bare_turn_on=False: should NOT mark (fix for issue #1378)
     if adapt_only_on_bare_turn_on:
-        assert (
-            manual_control[ENTITY_LIGHT_1] == LightControlAttributes.BRIGHTNESS
-        ), manual_control
+        assert manual_control[ENTITY_LIGHT_1] == LightControlAttributes.BRIGHTNESS, (
+            manual_control
+        )
     else:
         assert not manual_control[ENTITY_LIGHT_1], manual_control
     # Reset for next test
@@ -764,9 +818,9 @@ async def test_manual_control(
     assert not manual_control[ENTITY_LIGHT_1], manual_control
     # Now change brightness while ON - this should always be manual control
     await turn_light(True, brightness=increased_brightness())
-    assert (
-        manual_control[ENTITY_LIGHT_1] == LightControlAttributes.BRIGHTNESS
-    ), manual_control
+    assert manual_control[ENTITY_LIGHT_1] == LightControlAttributes.BRIGHTNESS, (
+        manual_control
+    )
 
     # Check that toggling (sleep mode) switch resets manual control
     for entity_id in [switch.entity_id, switch.sleep_mode_switch.entity_id]:
@@ -933,7 +987,7 @@ async def test_auto_reset_manual_control(hass):
 
 async def test_adaptation_attribute_selection(hass):
     """Test the 'manual control' tracking."""
-    switch, (light, *_) = await setup_lights_and_switch(hass)
+    switch, (_light, *_) = await setup_lights_and_switch(hass)
 
     # Assert default settings
     assert switch._take_over_control
@@ -1523,7 +1577,7 @@ async def test_offset_too_large(hass):
     which makes the adaptive lighting algorithm fail with a ValueError.
     """
     _, switch = await setup_switch(hass, {CONF_SUNRISE_OFFSET: 3600 * 12})
-    with pytest.raises(ValueError, match="sun events.*not in the expected order"):
+    with pytest.raises(ValueError, match=r"sun events.*not in the expected order"):
         await switch._update_attrs_and_maybe_adapt_lights(
             context=switch.create_context("test"),
         )
@@ -1549,6 +1603,442 @@ async def test_async_update_at_interval_action(hass):
     """Test '_async_update_at_interval_action' method."""
     _, switch = await setup_switch(hass, {})
     await switch._async_update_at_interval_action()
+
+
+async def test_intelligence_disabled_preserves_existing_adaptation(hass):
+    """The default-disabled feature leaves the existing sun target authoritative."""
+    switch, _ = await setup_lights_and_switch(hass)
+
+    with patch(
+        "homeassistant.components.adaptive_lighting.color_and_brightness.utcnow",
+        return_value=SUNSET.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+            dt_util.UTC,
+        ),
+    ):
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("test"),
+            transition=0,
+            force=True,
+        )
+    await hass.async_block_till_done()
+
+    assert switch._intelligence_enabled is False
+    assert "intelligence" not in switch.extra_state_attributes
+    assert switch.manager.last_service_data[ENTITY_LIGHT_1][ATTR_BRIGHTNESS] == 255
+
+
+async def test_intelligence_shadow_mode_suppresses_all_light_turn_on_calls(hass):
+    """Shadow mode computes decisions but cannot actuate, including force updates."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+    events = []
+    remove_listener = hass.bus.async_listen(
+        EVENT_CALL_SERVICE,
+        lambda event: events.append(event),
+    )
+    try:
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("shadow"),
+            transition=0,
+            force=True,
+        )
+        await hass.async_block_till_done()
+    finally:
+        remove_listener()
+
+    light_turn_on_events = [
+        event
+        for event in events
+        if event.data.get(ATTR_DOMAIN) == LIGHT_DOMAIN
+        and event.data.get(ATTR_SERVICE) == SERVICE_TURN_ON
+    ]
+    assert light_turn_on_events == []
+    decision = switch.extra_state_attributes["intelligence_decisions"][ENTITY_LIGHT_1]
+    assert decision["baseline_brightness_pct"] is not None
+    assert decision["target_brightness_pct"] is not None
+    assert decision["confidence"] >= 0
+    assert decision["reason"]
+    assert decision["provenance"]
+    assert decision["can_turn_on"] is False
+
+
+async def test_intelligence_preview_service_is_read_only_and_emits_decision(hass):
+    """Preview publishes an inspectable decision without calling a light service."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+    preview_events = []
+    service_events = []
+    remove_preview = hass.bus.async_listen(
+        f"{DOMAIN}.intelligence_{SERVICE_PREVIEW}",
+        preview_events.append,
+    )
+    remove_services = hass.bus.async_listen(EVENT_CALL_SERVICE, service_events.append)
+    try:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_PREVIEW,
+            {ATTR_ENTITY_ID: switch.entity_id},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+    finally:
+        remove_preview()
+        remove_services()
+
+    assert len(preview_events) == 1
+    assert preview_events[0].data[ATTR_ENTITY_ID] == switch.entity_id
+    assert preview_events[0].data["shadow_mode"] is True
+    assert ENTITY_LIGHT_1 in preview_events[0].data["decisions"]
+    assert not [
+        event
+        for event in service_events
+        if event.data.get(ATTR_DOMAIN) == LIGHT_DOMAIN
+        and event.data.get(ATTR_SERVICE) in {SERVICE_TURN_ON, SERVICE_TURN_OFF}
+    ]
+
+
+async def test_intelligence_active_mode_overrides_brightness_only(hass):
+    """Active intelligence lowers an already-on target without changing color."""
+    hass.states.async_set("sensor.semantic_intent", "video")
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+            CONF_SEMANTIC_INTENT_ENTITY: "sensor.semantic_intent",
+            CONF_VIDEO_BRIGHTNESS_CAP: 20,
+        },
+    )
+
+    with patch(
+        "homeassistant.components.adaptive_lighting.color_and_brightness.utcnow",
+        return_value=SUNSET.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+            dt_util.UTC,
+        ),
+    ):
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("active"),
+            transition=0,
+            force=True,
+        )
+    await hass.async_block_till_done()
+
+    decision = switch.extra_state_attributes["intelligence_decisions"][ENTITY_LIGHT_1]
+    assert decision["intent"] == "video"
+    assert decision["can_adjust"] is True
+    assert decision["target_brightness_pct"] == 20
+    assert switch.manager.last_service_data[ENTITY_LIGHT_1][ATTR_BRIGHTNESS] == round(
+        255 * 20 / 100,
+    )
+
+
+@pytest.mark.parametrize(
+    ("media_attributes", "expected_intent", "expected_target"),
+    [
+        ({"media_content_type": "movie", "app_name": "Plex"}, "video", 20),
+        ({"app_name": "Spotify"}, "ambient", 60),
+        ({"app_name": "Steam"}, "task", 100),
+    ],
+)
+async def test_intelligence_classifies_media_type_and_app(
+    hass,
+    media_attributes,
+    expected_intent,
+    expected_target,
+):
+    """Content type wins, with conservative app classification as fallback."""
+    hass.states.async_set("media_player.test", "playing", media_attributes)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_MEDIA_ENTITIES: ["media_player.test"],
+            CONF_VIDEO_BRIGHTNESS_CAP: 20,
+        },
+    )
+
+    decision = switch.preview_intelligence()[ENTITY_LIGHT_1]
+    assert decision["intent"] == expected_intent
+    assert decision["target_brightness_pct"] == expected_target
+
+
+async def test_intelligence_alarm_outranks_media_and_alarm_off_clears(hass):
+    """A triggered alarm is emergency context; disarmed is not emergency."""
+    hass.states.async_set("sensor.security", "alarm")
+    hass.states.async_set(
+        "media_player.test",
+        "playing",
+        {"media_content_type": "movie", "app_name": "Netflix"},
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_SECURITY_STATE_ENTITY: "sensor.security",
+            CONF_MEDIA_ENTITIES: ["media_player.test"],
+        },
+    )
+
+    emergency = switch.preview_intelligence()[ENTITY_LIGHT_1]
+    assert emergency["intent"] == "emergency"
+    assert emergency["can_turn_on"] is True
+
+    hass.states.async_set("sensor.security", "disarmed")
+    cleared = switch.preview_intelligence()[ENTITY_LIGHT_1]
+    assert cleared["intent"] == "video"
+
+
+async def test_intelligence_training_forces_shadow_then_auto_promotes(hass):
+    """A qualified local training session may leave shadow only after its gate."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_DAYS: 7,
+            CONF_INTELLIGENCE_AUTO_PROMOTE: True,
+            CONF_INTELLIGENCE_MINIMUM_SAMPLES: 1,
+            CONF_INTELLIGENCE_MINIMUM_CONFIDENCE: 1.0,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+    assert switch._intelligence_shadow_actuation_blocked is True
+
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, {ATTR_BRIGHTNESS: 128})
+    switch.fire_manual_control_event(
+        ENTITY_LIGHT_1,
+        Context(user_id="00000000000000000000000000000001"),
+    )
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 1, (
+        switch._training.last_rejection_reason,
+        switch._training.sample_counts,
+        hass.states.get(ENTITY_LIGHT_1),
+    )
+
+    promoted = await switch._training.async_evaluate_promotion(
+        now=switch._training.deadline,
+    )
+    assert promoted is True
+    assert switch._intelligence_shadow_actuation_blocked is False
+    assert switch.extra_state_attributes["intelligence_training"]["phase"] == "active"
+
+
+async def test_intelligence_runtime_reconciles_new_removed_and_moved_entities(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Registry changes update context inventory without adopting new actuators."""
+    await setup_lights(hass)
+    living = area_registry.async_create("Living")
+    office = area_registry.async_create("Office")
+    entity_registry.async_update_entity(ENTITY_LIGHT_1, area_id=living.id)
+    motion = entity_registry.async_get_or_create(
+        "binary_sensor",
+        "test",
+        "living_motion",
+    )
+    entity_registry.async_update_entity(
+        motion.entity_id,
+        area_id=living.id,
+        device_class="motion",
+    )
+    hass.states.async_set(motion.entity_id, STATE_OFF, {"device_class": "motion"})
+
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1],
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+    inventory = switch.extra_state_attributes["intelligence_discovery"]
+    assert motion.entity_id in {item["entity_id"] for item in inventory["entities"]}
+
+    candidate = entity_registry.async_get_or_create("light", "test", "new_light")
+    entity_registry.async_update_entity(candidate.entity_id, area_id=living.id)
+    hass.states.async_set(candidate.entity_id, STATE_OFF)
+    await hass.async_block_till_done()
+    inventory = switch.extra_state_attributes["intelligence_discovery"]
+    candidate_item = next(
+        item
+        for item in inventory["entities"]
+        if item["entity_id"] == candidate.entity_id
+    )
+    assert candidate_item["explicit_controlled"] is False
+    assert candidate.entity_id not in switch.lights
+
+    entity_registry.async_update_entity(motion.entity_id, area_id=office.id)
+    await hass.async_block_till_done()
+    inventory = switch.extra_state_attributes["intelligence_discovery"]
+    assert motion.entity_id in inventory["removed"]
+
+
+async def test_intelligence_active_mode_preserves_baseline_without_permission(hass):
+    """A preview-only fallback cannot become an already-on brightness command."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+        },
+    )
+
+    with patch(
+        "homeassistant.components.adaptive_lighting.color_and_brightness.utcnow",
+        return_value=SUNSET.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+            dt_util.UTC,
+        ),
+    ):
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("no-permission"),
+            transition=0,
+            force=True,
+        )
+    await hass.async_block_till_done()
+
+    decision = switch.extra_state_attributes["intelligence_decisions"][ENTITY_LIGHT_1]
+    assert decision["intent"] == "ambient"
+    assert decision["can_adjust"] is False
+    assert decision["can_turn_on"] is False
+    assert decision["target_brightness_pct"] == decision["baseline_brightness_pct"]
+    assert ATTR_BRIGHTNESS not in switch.manager.last_service_data.get(
+        ENTITY_LIGHT_1,
+        {},
+    )
+
+
+async def test_intelligence_apply_cannot_turn_on_without_policy_permission(hass):
+    """Even an apply request cannot smuggle a preview-only target into power-on."""
+    await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+        },
+    )
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_OFF,
+        {ATTR_ENTITY_ID: ENTITY_LIGHT_1},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.is_state(ENTITY_LIGHT_1, STATE_OFF)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_APPLY,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1],
+            CONF_TURN_ON_LIGHTS: True,
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.is_state(ENTITY_LIGHT_1, STATE_OFF)
+
+
+async def test_intelligence_manual_hold_remains_authoritative(hass):
+    """A configured manual hold prevents intelligence from overriding brightness."""
+    hass.states.async_set("input_boolean.manual_hold", STATE_ON)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+            CONF_MANUAL_HOLD_ENTITY: "input_boolean.manual_hold",
+            CONF_NIGHT_BRIGHTNESS_CAP: 1,
+        },
+    )
+    state = hass.states.get(ENTITY_LIGHT_1)
+    assert state is not None
+    hass.states.async_set(
+        ENTITY_LIGHT_1,
+        state.state,
+        {**state.attributes, ATTR_BRIGHTNESS: 51},
+    )
+    direct_decision = switch._intelligence_decision(
+        ENTITY_LIGHT_1,
+        baseline_brightness_pct=100,
+    )
+    assert direct_decision["target_brightness_pct"] == 20
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.adaptive_lighting.color_and_brightness.utcnow",
+        return_value=SUNSET.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+            dt_util.UTC,
+        ),
+    ):
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("manual-hold"),
+            transition=0,
+            force=True,
+        )
+    await hass.async_block_till_done()
+
+    decision = switch.extra_state_attributes["intelligence_decisions"][ENTITY_LIGHT_1]
+    assert decision["intent"] == "manual"
+    assert ATTR_BRIGHTNESS not in switch.manager.last_service_data.get(
+        ENTITY_LIGHT_1,
+        {},
+    )
+
+
+async def test_intelligence_sleep_cap_applies_to_existing_on_light(hass):
+    """Sleep context can lower an already-on target to the configured night cap."""
+    hass.states.async_set("input_boolean.sleep", STATE_ON)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+            CONF_SLEEP_ENTITY: "input_boolean.sleep",
+            CONF_NIGHT_BRIGHTNESS_CAP: 8,
+        },
+    )
+
+    with patch(
+        "homeassistant.components.adaptive_lighting.color_and_brightness.utcnow",
+        return_value=SUNSET.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+            dt_util.UTC,
+        ),
+    ):
+        await switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("sleep-cap"),
+            transition=0,
+            force=True,
+        )
+    await hass.async_block_till_done()
+
+    decision = switch.extra_state_attributes["intelligence_decisions"][ENTITY_LIGHT_1]
+    assert decision["intent"] == "sleep"
+    assert decision["target_brightness_pct"] == 8
+    assert switch.manager.last_service_data[ENTITY_LIGHT_1][ATTR_BRIGHTNESS] == round(
+        255 * 8 / 100,
+    )
 
 
 @pytest.mark.parametrize("separate_turn_on_commands", (True, False))
@@ -1627,7 +2117,7 @@ def mock_area_registry(
         # https://github.com/home-assistant/core/pull/114777
         registry.areas = ar.AreaRegistryItems()
     elif dt == datetime.date(2024, 4, 1):
-        from homeassistant.helpers.normalized_name_base_registry import (
+        from homeassistant.helpers.normalized_name_base_registry import (  # noqa: PLC0415
             NormalizedNameBaseRegistryItems,
         )
 
@@ -2048,7 +2538,9 @@ async def test_proactive_multiple_lights_all_at_once(hass):
 
 async def test_proactive_multiple_lights_turn_on_non_managed_light(hass):
     """Create switch and demo lights."""
-    lights, switch1, switch2 = await setup_proactive_multiple_lights_two_switches(hass)
+    lights, _switch1, _switch2 = await setup_proactive_multiple_lights_two_switches(
+        hass,
+    )
     turn_ons = await _turn_on_and_track_event_contexts(hass, "test1", lights)
     assert len(turn_ons) == 3, turn_ons
     await hass.async_block_till_done()
@@ -2070,7 +2562,9 @@ async def test_proactive_multiple_lights_turn_on_non_managed_light(hass):
 
 async def test_proactive_multiple_lights_turn_on_managed_lights_only(hass):
     """Create switch and demo lights."""
-    lights, switch1, switch2 = await setup_proactive_multiple_lights_two_switches(hass)
+    lights, _switch1, _switch2 = await setup_proactive_multiple_lights_two_switches(
+        hass,
+    )
     _LOGGER.debug("Start test_proactive_multiple_lights_all_at_once")
     # Setup demo lights and turn on
     events = await _turn_on_and_track_event_contexts(
@@ -2197,7 +2691,7 @@ async def test_adapt_until_sleep_and_rgb_colors(hass):
         hass,
         {"latitude": lat, "longitude": long, "time_zone": timezone, "country": "US"},
     )
-    switch, lights = await setup_lights_and_switch(
+    switch, _lights = await setup_lights_and_switch(
         hass,
         {
             CONF_SUNRISE_TIME: datetime.time(SUNRISE.hour),
@@ -2964,7 +3458,9 @@ async def test_skipped_lights_context_not_from_arbitrary_switch(hass):
     See: https://github.com/basnijholt/adaptive-lighting/pull/1348
     """
     # Setup two switches with different lights
-    lights, switch1, switch2 = await setup_proactive_multiple_lights_two_switches(hass)
+    lights, _switch1, _switch2 = await setup_proactive_multiple_lights_two_switches(
+        hass,
+    )
 
     # Turn on all three lights at once:
     # - ENTITY_LIGHT_1 is in switch1
@@ -2979,9 +3475,9 @@ async def test_skipped_lights_context_not_from_arbitrary_switch(hass):
 
     # Find the skipped event (contains ":skpp:" in context)
     skipped_events = [e for e in events if ":skpp:" in e.context.id]
-    assert (
-        len(skipped_events) == 1
-    ), f"Expected 1 skipped event, got {len(skipped_events)}"
+    assert len(skipped_events) == 1, (
+        f"Expected 1 skipped event, got {len(skipped_events)}"
+    )
 
     skipped_event = skipped_events[0]
     skipped_context_id = skipped_event.context.id
@@ -3196,12 +3692,12 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
 
     last_sd = switch.manager.last_service_data.get(ENTITY_LIGHT_1)
     assert last_sd is not None, "last_service_data not set after force adapt"
-    assert (
-        ATTR_BRIGHTNESS in last_sd
-    ), f"brightness missing from last_service_data after split calls: {last_sd}"
-    assert (
-        ATTR_COLOR_TEMP_KELVIN in last_sd or ATTR_RGB_COLOR in last_sd
-    ), f"color missing from last_service_data after split calls: {last_sd}"
+    assert ATTR_BRIGHTNESS in last_sd, (
+        f"brightness missing from last_service_data after split calls: {last_sd}"
+    )
+    assert ATTR_COLOR_TEMP_KELVIN in last_sd or ATTR_RGB_COLOR in last_sd, (
+        f"color missing from last_service_data after split calls: {last_sd}"
+    )
 
     al_brightness = light.brightness
     assert al_brightness is not None
@@ -3232,6 +3728,6 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
 
         await update(force=False)
 
-    assert (
-        light.brightness == manual_brightness
-    ), f"AL overrode manual brightness {manual_brightness} with {al_brightness}"
+    assert light.brightness == manual_brightness, (
+        f"AL overrode manual brightness {manual_brightness} with {al_brightness}"
+    )

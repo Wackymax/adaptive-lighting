@@ -41,6 +41,9 @@ COVER_DOMAIN = "cover"
 MEDIA_PLAYER_DOMAIN = "media_player"
 ALARM_CONTROL_PANEL_DOMAIN = "alarm_control_panel"
 CALENDAR_DOMAIN = "calendar"
+WEATHER_DOMAIN = "weather"
+SUN_DOMAIN = "sun"
+PERSON_DOMAIN = "person"
 
 STATUS_AVAILABLE = "available"
 STATUS_UNAVAILABLE = "unavailable"
@@ -62,6 +65,10 @@ _CONTEXT_CAPABILITIES = frozenset(
         "media",
         "security",
         "holiday_calendar",
+        "weather",
+        "daylight_proxy",
+        "household_presence",
+        "arrival",
     },
 )
 
@@ -120,7 +127,7 @@ class EntityClassification:
         }
 
 
-def classify_entity(  # noqa: PLR0912 - one auditable branch per HA domain
+def classify_entity(  # noqa: PLR0912,PLR0915 - one auditable branch per HA domain
     entry: entity_registry.RegistryEntry,
     state: State | None = None,
 ) -> EntityClassification:
@@ -166,6 +173,19 @@ def classify_entity(  # noqa: PLR0912 - one auditable branch per HA domain
         }
         if device_class in binary_classes:
             capabilities.extend(binary_classes[device_class])
+        entity_name = entry.entity_id.lower()
+        if "arrival" in entity_name or "just_arrived" in entity_name:
+            capabilities.extend(("arrival", "context"))
+        if any(token in entity_name for token in ("household_home", "house_occupied")):
+            capabilities.extend(("household_presence", "context"))
+        # Home Assistant's Workday integration can be configured as a precise
+        # public-holiday sensor by including only ``holiday``.  Detect that
+        # semantic contract from state attributes instead of relying on a
+        # user-selected entity name.
+        if state is not None and set(state.attributes.get("workdays", ())) == {
+            "holiday",
+        }:
+            capabilities.extend(("holiday_calendar", "context"))
     elif domain == COVER_DOMAIN:
         capabilities.append("cover")
         cover_classes = {
@@ -183,6 +203,16 @@ def classify_entity(  # noqa: PLR0912 - one auditable branch per HA domain
         ) or entry.unit_of_measurement
         if device_class == "illuminance" or str(unit).lower() in {"lx", "lux"}:
             capabilities.extend(("illuminance", "context"))
+        sensor_name = " ".join(
+            value
+            for value in (entry.entity_id, entry.name, entry.original_name)
+            if value
+        ).lower()
+        if any(
+            token in sensor_name
+            for token in ("solar", "pv", "photovoltaic", "inverter")
+        ):
+            capabilities.extend(("daylight_proxy", "solar_proxy", "context"))
     elif domain == MEDIA_PLAYER_DOMAIN:
         capabilities.extend(("media_player", "media", "context"))
     elif domain == ALARM_CONTROL_PANEL_DOMAIN:
@@ -201,6 +231,12 @@ def classify_entity(  # noqa: PLR0912 - one auditable branch per HA domain
         capabilities.append("calendar")
         if any(token in name for token in ("holiday", "public holiday", "holidays")):
             capabilities.extend(("holiday_calendar", "context"))
+    elif domain == WEATHER_DOMAIN:
+        capabilities.extend(("weather", "daylight_proxy", "context"))
+    elif domain == SUN_DOMAIN:
+        capabilities.extend(("sun", "daylight_proxy", "context"))
+    elif domain == PERSON_DOMAIN:
+        capabilities.extend(("person", "household_presence", "context"))
     else:
         capabilities.append(
             domain if domain in {"switch", "fan", "climate"} else "other",
@@ -700,7 +736,15 @@ class EntityDiscoveryCoordinator:
             classification = classify_entity(entry, state)
             # Holiday calendars are installation-wide temporal context and
             # commonly have no area. Other entities remain area-scoped.
-            is_global_context = "holiday_calendar" in classification.capabilities
+            is_global_context = bool(
+                {
+                    "holiday_calendar",
+                    "weather",
+                    "daylight_proxy",
+                    "household_presence",
+                }
+                & set(classification.capabilities),
+            )
             if area_id not in area_ids and not is_global_context:
                 continue
             status, available = _state_status(state)
