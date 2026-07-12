@@ -7,9 +7,11 @@ observable context; they do not assert why a person chose that context.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
+from math import isfinite
 from typing import Generic, TypeVar
 
 
@@ -52,6 +54,43 @@ class OpeningState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class WeatherDaylightState(str, Enum):
+    """Coarse weather or daylight categories for advisory context."""
+
+    STORM = "storm"
+    RAIN = "rain"
+    CLOUDY = "cloudy"
+    BRIGHT = "bright"
+    DIM = "dim"
+    DARK = "dark"
+    UNKNOWN = "unknown"
+
+
+class HouseholdState(str, Enum):
+    """Explicit aggregate household presence states."""
+
+    HOME = "home"
+    AWAY = "away"
+    UNKNOWN = "unknown"
+
+
+class ArrivalState(str, Enum):
+    """Bounded arrival states; stale positive signals are not actionable."""
+
+    RECENT = "recent"
+    INACTIVE = "inactive"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+class SleepState(str, Enum):
+    """Explicit sleep context used only for combined priority ordering."""
+
+    SLEEPING = "sleeping"
+    AWAKE = "awake"
+    UNKNOWN = "unknown"
+
+
 class SemanticIntent(str, Enum):
     """Conservative semantic labels for observable context.
 
@@ -68,6 +107,16 @@ class SemanticIntent(str, Enum):
     MEDIA_AUDIO = "audio"
     MEDIA_GAME = "game"
     MEDIA_IDLE = "media_idle"
+    SLEEP = "sleep"
+    RECENT_ARRIVAL = "recent_arrival"
+    HOUSEHOLD_HOME = "household_home"
+    HOUSEHOLD_AWAY = "household_away"
+    WEATHER_STORM = "weather_storm"
+    WEATHER_RAIN = "weather_rain"
+    WEATHER_CLOUDY = "weather_cloudy"
+    DAYLIGHT_BRIGHT = "daylight_bright"
+    DAYLIGHT_DIM = "daylight_dim"
+    DAYLIGHT_DARK = "daylight_dark"
     OPENING_OPEN = "opening_open"
     OPENING_CLOSED = "opening_closed"
     UNKNOWN = "unknown"
@@ -123,6 +172,10 @@ class Classification(Generic[CategoryT]):
 SecurityClassification = Classification[SecurityState]
 MediaClassification = Classification[MediaState]
 OpeningClassification = Classification[OpeningState]
+WeatherDaylightClassification = Classification[WeatherDaylightState]
+HouseholdClassification = Classification[HouseholdState]
+ArrivalClassification = Classification[ArrivalState]
+SleepClassification = Classification[SleepState]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +183,11 @@ class ContextClassification:
     """Combined context with safety-first semantic ordering."""
 
     security: SecurityClassification
+    sleep: SleepClassification
+    arrival: ArrivalClassification
     media: MediaClassification
+    weather_daylight: WeatherDaylightClassification
+    household: HouseholdClassification
     opening: OpeningClassification
     semantic_intents: tuple[SemanticIntent, ...]
     primary_semantic_intent: SemanticIntent
@@ -167,6 +224,34 @@ _SECURITY_STATUS_KEYS = (
 _MEDIA_CONTENT_KEYS = ("media_content_type", "media_type", "content_type")
 _MEDIA_APP_KEYS = ("app_id", "app_name")
 _MEDIA_TITLE_KEYS = ("media_title", "title")
+_WEATHER_KEYS = (
+    "weather_state",
+    "condition",
+    "cloud_coverage",
+    "cloudiness",
+    "precipitation",
+    "precipitation_rate",
+    "sun_elevation",
+    "elevation",
+    "solar_irradiance",
+    "irradiance",
+    "pv_power",
+    "solar_power",
+)
+_HOUSEHOLD_KEYS = ("home", "occupied", "person_states", "persons", "people")
+_ARRIVAL_KEYS = (
+    "arrival",
+    "arrived",
+    "arrival_signal",
+    "observed_at",
+    "age",
+    "age_seconds",
+    "max_age",
+    "max_age_seconds",
+    "now",
+    "evaluated_at",
+)
+_SLEEP_KEYS = ("sleep", "sleeping", "sleep_mode")
 
 
 def _normalise(value: object) -> str:
@@ -193,17 +278,14 @@ def _snapshot_parts(snapshot: StateSnapshot | Mapping[str, object]) -> StateSnap
         dict(raw_attributes) if isinstance(raw_attributes, Mapping) else {}
     )
     for key in (
-        "alarm_state",
-        "security_state",
-        "alarm_status",
-        "security_status",
-        "media_content_type",
-        "media_type",
-        "content_type",
-        "app_id",
-        "app_name",
-        "media_title",
-        "title",
+        *_SECURITY_STATUS_KEYS,
+        *_MEDIA_CONTENT_KEYS,
+        *_MEDIA_APP_KEYS,
+        *_MEDIA_TITLE_KEYS,
+        *_WEATHER_KEYS,
+        *_HOUSEHOLD_KEYS,
+        *_ARRIVAL_KEYS,
+        *_SLEEP_KEYS,
         "device_class",
     ):
         if key in snapshot and key not in attributes:
@@ -239,13 +321,15 @@ def _provenance(snapshot: StateSnapshot, keys: tuple[str, ...]) -> tuple[str, ..
     if snapshot.state is not None:
         fields.append("state")
     fields.extend(
-        f"attributes.{key}" for key in keys if _text(_attribute(snapshot, key))
+        f"attributes.{key}"
+        for key in keys
+        if _attribute(snapshot, key) is not None
     )
     if snapshot.entity_id:
         fields.append("entity_id")
     if snapshot.domain:
         fields.append("domain")
-    if _text(_attribute(snapshot, "device_class")):
+    if _attribute(snapshot, "device_class") is not None:
         fields.append("attributes.device_class")
     return tuple(dict.fromkeys(fields))
 
@@ -673,6 +757,529 @@ def classify_opening_state(
     )
 
 
+def _number(value: object) -> float | None:
+    """Parse a finite numeric sensor value without accepting booleans."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str) and _normalise(value) not in _UNKNOWN_TEXT:
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if isfinite(parsed) else None
+
+
+def _first_numeric(
+    snapshot: StateSnapshot,
+    keys: tuple[str, ...],
+) -> tuple[str, float] | None:
+    """Return the first finite numeric attribute in deterministic key order."""
+    for key in keys:
+        value = _number(_attribute(snapshot, key))
+        if value is not None:
+            return f"attributes.{key}", value
+    entity_id = _normalise(snapshot.entity_id)
+    state_value = _number(snapshot.state)
+    if state_value is not None and any(
+        _normalise(key) in entity_id for key in keys
+    ):
+        return "state", state_value
+    return None
+
+
+def _weather_semantic(category: WeatherDaylightState) -> SemanticIntent:
+    return {
+        WeatherDaylightState.STORM: SemanticIntent.WEATHER_STORM,
+        WeatherDaylightState.RAIN: SemanticIntent.WEATHER_RAIN,
+        WeatherDaylightState.CLOUDY: SemanticIntent.WEATHER_CLOUDY,
+        WeatherDaylightState.BRIGHT: SemanticIntent.DAYLIGHT_BRIGHT,
+        WeatherDaylightState.DIM: SemanticIntent.DAYLIGHT_DIM,
+        WeatherDaylightState.DARK: SemanticIntent.DAYLIGHT_DARK,
+        WeatherDaylightState.UNKNOWN: SemanticIntent.UNKNOWN,
+    }[category]
+
+
+def _weather_result(
+    category: WeatherDaylightState,
+    *,
+    confidence: float,
+    reason: str,
+    provenance: tuple[str, ...],
+) -> WeatherDaylightClassification:
+    return Classification(
+        category=category,
+        confidence=confidence,
+        reasons=(reason,),
+        provenance=provenance,
+        semantic_intents=(_weather_semantic(category),),
+        context_only=True,
+    )
+
+
+def classify_weather_daylight(  # noqa: PLR0911, PLR0912
+    snapshot: StateSnapshot | Mapping[str, object],
+) -> WeatherDaylightClassification:
+    """Classify coarse weather/daylight context from explicit sensor evidence.
+
+    Solar irradiance is direct outdoor light evidence.  Positive PV production
+    is only a lower-confidence daylight proxy: it is never described as lux,
+    illuminance, circadian, or melanopic evidence, and zero PV does not prove
+    darkness.
+    """
+    parts = _snapshot_parts(snapshot)
+    provenance = _provenance(parts, _WEATHER_KEYS)
+    condition_values = (
+        ("state", parts.state),
+        ("attributes.weather_state", _attribute(parts, "weather_state")),
+        ("attributes.condition", _attribute(parts, "condition")),
+    )
+    conditions = tuple(
+        (field, _normalise(value), _text(value))
+        for field, value in condition_values
+        if _normalise(value) not in _UNKNOWN_TEXT
+    )
+
+    storm = next(
+        (
+            item
+            for item in conditions
+            if _has_token(
+                item[1],
+                frozenset({"storm", "stormy", "thunderstorm", "lightning"}),
+            )
+        ),
+        None,
+    )
+    if storm is not None:
+        return _weather_result(
+            WeatherDaylightState.STORM,
+            confidence=1.0,
+            reason=f"{storm[0]} reported storm condition '{storm[2]}'",
+            provenance=provenance,
+        )
+
+    rain = next(
+        (
+            item
+            for item in conditions
+            if _has_token(
+                item[1],
+                frozenset({"rain", "rainy", "pouring", "hail", "snowy"}),
+            )
+        ),
+        None,
+    )
+    precipitation = _first_numeric(
+        parts,
+        ("precipitation", "precipitation_rate"),
+    )
+    if rain is not None or (precipitation is not None and precipitation[1] > 0):
+        source, detail = (
+            (rain[0], f"condition '{rain[2]}'")
+            if rain is not None
+            else (precipitation[0], f"positive precipitation {precipitation[1]:g}")
+        )
+        return _weather_result(
+            WeatherDaylightState.RAIN,
+            confidence=0.95,
+            reason=f"{source} reported {detail}",
+            provenance=provenance,
+        )
+
+    cloudy = next(
+        (
+            item
+            for item in conditions
+            if item[1] in {"cloudy", "partlycloudy", "partly_cloudy", "fog"}
+        ),
+        None,
+    )
+    cloud_coverage = _first_numeric(parts, ("cloud_coverage", "cloudiness"))
+    if cloudy is not None or (
+        cloud_coverage is not None and cloud_coverage[1] >= 70
+    ):
+        source, detail = (
+            (cloudy[0], f"condition '{cloudy[2]}'")
+            if cloudy is not None
+            else (
+                cloud_coverage[0],
+                f"cloud coverage {cloud_coverage[1]:g}%",
+            )
+        )
+        return _weather_result(
+            WeatherDaylightState.CLOUDY,
+            confidence=0.9,
+            reason=f"{source} reported {detail}",
+            provenance=provenance,
+        )
+
+    sun = _first_numeric(parts, ("sun_elevation", "elevation"))
+    if sun is not None:
+        if sun[1] <= -6:
+            category = WeatherDaylightState.DARK
+        elif sun[1] < 6:
+            category = WeatherDaylightState.DIM
+        else:
+            category = WeatherDaylightState.BRIGHT
+        return _weather_result(
+            category,
+            confidence=0.95,
+            reason=f"{sun[0]} reported sun elevation {sun[1]:g} degrees",
+            provenance=provenance,
+        )
+
+    irradiance = _first_numeric(parts, ("solar_irradiance", "irradiance"))
+    if irradiance is not None and irradiance[1] > 0:
+        category = (
+            WeatherDaylightState.BRIGHT
+            if irradiance[1] >= 120
+            else WeatherDaylightState.DIM
+        )
+        return _weather_result(
+            category,
+            confidence=0.85,
+            reason=f"{irradiance[0]} reported outdoor solar irradiance {irradiance[1]:g}",
+            provenance=provenance,
+        )
+
+    pv = _first_numeric(parts, ("pv_power", "solar_power"))
+    if pv is not None and pv[1] > 50:
+        return _weather_result(
+            WeatherDaylightState.BRIGHT,
+            confidence=0.65,
+            reason=f"{pv[0]} reported positive PV production {pv[1]:g}; PV is a daylight proxy, not lux or melanopic light",
+            provenance=provenance,
+        )
+
+    clear_night = next((item for item in conditions if item[1] == "clear_night"), None)
+    if clear_night is not None:
+        return _weather_result(
+            WeatherDaylightState.DARK,
+            confidence=0.9,
+            reason=f"{clear_night[0]} reported explicit clear-night condition",
+            provenance=provenance,
+        )
+    sunny = next((item for item in conditions if item[1] in {"sunny", "clear"}), None)
+    if sunny is not None:
+        return _weather_result(
+            WeatherDaylightState.BRIGHT,
+            confidence=0.75,
+            reason=f"{sunny[0]} reported '{sunny[2]}' without direct light measurement",
+            provenance=provenance,
+        )
+
+    reason = "weather and daylight values are missing, unavailable, or not safely classifiable"
+    if pv is not None and pv[1] == 0:
+        reason = f"{pv[0]} reported zero PV; zero production does not prove darkness and is not lux or melanopic evidence"
+    elif irradiance is not None and irradiance[1] == 0:
+        reason = f"{irradiance[0]} reported zero irradiance without corroborating sun evidence"
+    return _weather_result(
+        WeatherDaylightState.UNKNOWN,
+        confidence=0.0,
+        reason=reason,
+        provenance=provenance,
+    )
+
+
+def _explicit_boolean(value: object) -> bool | None:
+    """Normalize only explicit boolean-like states."""
+    if isinstance(value, bool):
+        return value
+    normalized = _normalise(value)
+    if normalized in {"on", "true", "yes", "active"}:
+        return True
+    if normalized in {"off", "false", "no", "inactive"}:
+        return False
+    return None
+
+
+def _household_boolean(value: object) -> bool | None:
+    """Normalize explicit home/away vocabulary in household scope only."""
+    explicit = _explicit_boolean(value)
+    if explicit is not None:
+        return explicit
+    normalized = _normalise(value)
+    if normalized in {"home", "present", "occupied"}:
+        return True
+    if normalized in {"away", "not_home", "absent", "vacant"}:
+        return False
+    return None
+
+
+def _person_aggregate(value: object) -> HouseholdState | None:
+    """Classify a complete sequence/mapping of explicit person states."""
+    if isinstance(value, Mapping):
+        states = tuple(value.values())
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        states = tuple(value)
+    else:
+        return None
+    if not states:
+        return None
+    normalized = tuple(
+        _normalise(
+            item.state
+            if isinstance(item, StateSnapshot)
+            else item.get("state")
+            if isinstance(item, Mapping)
+            else item,
+        )
+        for item in states
+    )
+    if any(item == "home" for item in normalized):
+        return HouseholdState.HOME
+    if all(item in {"away", "not_home"} for item in normalized):
+        return HouseholdState.AWAY
+    return HouseholdState.UNKNOWN
+
+
+def classify_household_state(
+    snapshot: StateSnapshot | Mapping[str, object],
+) -> HouseholdClassification:
+    """Classify home/away only from explicit boolean or person aggregates."""
+    parts = _snapshot_parts(snapshot)
+    provenance = _provenance(parts, _HOUSEHOLD_KEYS)
+    direct_values = (
+        ("state", parts.state),
+        ("attributes.home", _attribute(parts, "home")),
+        ("attributes.occupied", _attribute(parts, "occupied")),
+    )
+    for source, value in direct_values:
+        explicit = _household_boolean(value)
+        if explicit is not None:
+            category = HouseholdState.HOME if explicit else HouseholdState.AWAY
+            semantic = (
+                SemanticIntent.HOUSEHOLD_HOME
+                if explicit
+                else SemanticIntent.HOUSEHOLD_AWAY
+            )
+            return Classification(
+                category=category,
+                confidence=1.0,
+                reasons=(f"{source} explicitly reported {category.value}",),
+                provenance=provenance,
+                semantic_intents=(semantic,),
+                context_only=True,
+            )
+
+    aggregate_values = (
+        ("state", parts.state),
+        ("person_states", _attribute(parts, "person_states")),
+        ("persons", _attribute(parts, "persons")),
+        ("people", _attribute(parts, "people")),
+    )
+    for key, value in aggregate_values:
+        aggregate = _person_aggregate(value)
+        if aggregate in {HouseholdState.HOME, HouseholdState.AWAY}:
+            semantic = (
+                SemanticIntent.HOUSEHOLD_HOME
+                if aggregate is HouseholdState.HOME
+                else SemanticIntent.HOUSEHOLD_AWAY
+            )
+            return Classification(
+                category=aggregate,
+                confidence=0.95,
+                reasons=(f"{key} supplied an explicit person aggregate",),
+                provenance=provenance,
+                semantic_intents=(semantic,),
+                context_only=True,
+            )
+
+    return Classification(
+        category=HouseholdState.UNKNOWN,
+        confidence=0.0,
+        reasons=("household state is missing, unavailable, or not an explicit aggregate",),
+        provenance=provenance,
+        semantic_intents=(SemanticIntent.UNKNOWN,),
+        context_only=True,
+    )
+
+
+def _timestamp(value: object) -> float | None:
+    """Normalize numeric or ISO timestamps deterministically."""
+    numeric = _number(value)
+    if numeric is not None:
+        return numeric
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and _normalise(value) not in _UNKNOWN_TEXT:
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _arrival_signal(parts: StateSnapshot) -> tuple[str, bool] | None:
+    """Find the first explicit arrival signal in stable priority order."""
+    values = (
+        ("state", parts.state),
+        ("attributes.arrival", _attribute(parts, "arrival")),
+        ("attributes.arrived", _attribute(parts, "arrived")),
+        ("attributes.arrival_signal", _attribute(parts, "arrival_signal")),
+    )
+    for source, value in values:
+        normalized = _normalise(value)
+        if normalized in {"arrived", "arrival", "recent_arrival"}:
+            return source, True
+        explicit = _explicit_boolean(value)
+        if explicit is not None:
+            return source, explicit
+    return None
+
+
+def classify_arrival_state(  # noqa: PLR0912
+    snapshot: StateSnapshot | Mapping[str, object],
+    *,
+    observed_at: object | None = None,
+    age_seconds: object | None = None,
+    max_age_seconds: object | None = None,
+    now: object | None = None,
+) -> ArrivalClassification:
+    """Classify an explicit arrival only while its bounded lifetime is fresh."""
+    parts = _snapshot_parts(snapshot)
+    provenance = list(_provenance(parts, _ARRIVAL_KEYS))
+    signal = _arrival_signal(parts)
+    if signal is None:
+        return Classification(
+            category=ArrivalState.UNKNOWN,
+            confidence=0.0,
+            reasons=("arrival signal is missing, unavailable, or ambiguous",),
+            provenance=tuple(provenance),
+            semantic_intents=(SemanticIntent.UNKNOWN,),
+        )
+    signal_field, active = signal
+    if not active:
+        return Classification(
+            category=ArrivalState.INACTIVE,
+            confidence=1.0,
+            reasons=(f"{signal_field} explicitly reported no active arrival",),
+            provenance=tuple(provenance),
+            semantic_intents=(SemanticIntent.UNKNOWN,),
+        )
+
+    effective_observed = (
+        observed_at if observed_at is not None else _attribute(parts, "observed_at")
+    )
+    effective_age = age_seconds
+    if effective_age is None:
+        effective_age = _attribute(parts, "age_seconds")
+    if effective_age is None:
+        effective_age = _attribute(parts, "age")
+    effective_max_age = max_age_seconds
+    if effective_max_age is None:
+        effective_max_age = _attribute(parts, "max_age_seconds")
+    if effective_max_age is None:
+        effective_max_age = _attribute(parts, "max_age")
+    effective_now = now
+    if effective_now is None:
+        effective_now = _attribute(parts, "evaluated_at")
+    if effective_now is None:
+        effective_now = _attribute(parts, "now")
+
+    if observed_at is not None:
+        provenance.append("argument.observed_at")
+    if age_seconds is not None:
+        provenance.append("argument.age_seconds")
+    if max_age_seconds is not None:
+        provenance.append("argument.max_age_seconds")
+    if now is not None:
+        provenance.append("argument.now")
+
+    age = _number(effective_age)
+    if age is None and effective_observed is not None and effective_now is not None:
+        observed_timestamp = _timestamp(effective_observed)
+        now_timestamp = _timestamp(effective_now)
+        if observed_timestamp is not None and now_timestamp is not None:
+            age = now_timestamp - observed_timestamp
+    max_age = _number(effective_max_age)
+    provenance_tuple = tuple(dict.fromkeys(provenance))
+
+    if max_age is None or max_age <= 0:
+        return Classification(
+            category=ArrivalState.UNKNOWN,
+            confidence=0.0,
+            reasons=("positive arrival has no valid bounded max_age",),
+            provenance=provenance_tuple,
+            semantic_intents=(SemanticIntent.UNKNOWN,),
+        )
+    if age is None or age < 0:
+        return Classification(
+            category=ArrivalState.UNKNOWN,
+            confidence=0.0,
+            reasons=("positive arrival has no valid deterministic age",),
+            provenance=provenance_tuple,
+            semantic_intents=(SemanticIntent.UNKNOWN,),
+        )
+    if age > max_age:
+        return Classification(
+            category=ArrivalState.STALE,
+            confidence=0.0,
+            reasons=(f"arrival age {age:g}s exceeds max_age {max_age:g}s; stale arrival fails closed",),
+            provenance=provenance_tuple,
+            semantic_intents=(SemanticIntent.UNKNOWN,),
+        )
+
+    confidence = max(0.5, 1.0 - (0.5 * age / max_age))
+    return Classification(
+        category=ArrivalState.RECENT,
+        confidence=confidence,
+        reasons=(f"explicit arrival is fresh at age {age:g}s within max_age {max_age:g}s",),
+        provenance=provenance_tuple,
+        semantic_intents=(SemanticIntent.RECENT_ARRIVAL,),
+    )
+
+
+def classify_sleep_state(
+    snapshot: StateSnapshot | Mapping[str, object],
+) -> SleepClassification:
+    """Classify only an explicit sleep/wake signal for priority ordering."""
+    parts = _snapshot_parts(snapshot)
+    provenance = _provenance(parts, _SLEEP_KEYS)
+    values = (
+        ("state", parts.state),
+        ("attributes.sleep", _attribute(parts, "sleep")),
+        ("attributes.sleeping", _attribute(parts, "sleeping")),
+        ("attributes.sleep_mode", _attribute(parts, "sleep_mode")),
+    )
+    for source, value in values:
+        normalized = _normalise(value)
+        if normalized in {"sleep", "sleeping", "asleep"}:
+            active = True
+        elif normalized in {"awake", "waking"}:
+            active = False
+        else:
+            explicit = _explicit_boolean(value)
+            if explicit is None:
+                continue
+            active = explicit
+        category = SleepState.SLEEPING if active else SleepState.AWAKE
+        semantics = (SemanticIntent.SLEEP,) if active else (SemanticIntent.UNKNOWN,)
+        return Classification(
+            category=category,
+            confidence=1.0,
+            reasons=(f"{source} explicitly reported {category.value}",),
+            provenance=provenance,
+            semantic_intents=semantics,
+        )
+    return Classification(
+        category=SleepState.UNKNOWN,
+        confidence=0.0,
+        reasons=("sleep state is missing, unavailable, or ambiguous",),
+        provenance=provenance,
+        semantic_intents=(SemanticIntent.UNKNOWN,),
+    )
+
+
 def _nested_snapshot(
     snapshot: StateSnapshot | Mapping[str, object],
     names: tuple[str, ...],
@@ -696,12 +1303,27 @@ def _unique(values: tuple[SemanticIntent, ...]) -> tuple[SemanticIntent, ...]:
 def classify_context(
     snapshot: StateSnapshot | Mapping[str, object],
 ) -> ContextClassification:
-    """Classify security, media, and opening context with emergency precedence."""
+    """Classify context in a deterministic safety-first priority order."""
     security = classify_security_state(
         _nested_snapshot(snapshot, ("security", "alarm", "security_state")),
     )
+    sleep = classify_sleep_state(
+        _nested_snapshot(snapshot, ("sleep", "sleep_state", "sleep_mode")),
+    )
+    arrival = classify_arrival_state(
+        _nested_snapshot(snapshot, ("arrival", "arrival_state")),
+    )
     media = classify_media_state(
         _nested_snapshot(snapshot, ("media", "media_player", "media_state")),
+    )
+    weather_daylight = classify_weather_daylight(
+        _nested_snapshot(
+            snapshot,
+            ("weather_daylight", "weather", "daylight"),
+        ),
+    )
+    household = classify_household_state(
+        _nested_snapshot(snapshot, ("household", "household_state", "home_state")),
     )
     opening = classify_opening_state(
         _nested_snapshot(snapshot, ("opening", "door", "window", "cover", "garage")),
@@ -712,35 +1334,69 @@ def classify_context(
         primary = SemanticIntent.EMERGENCY
         reasons = (
             *security.reasons,
-            "security emergency outranks media and opening context",
+            "security emergency outranks media, sleep, arrival, weather, and other context",
         )
         confidence = security.confidence
     else:
+        priority_results: list[Classification[object]] = []
+        if sleep.category is SleepState.SLEEPING:
+            priority_results.append(sleep)
+        if security.is_known and security.category is not SecurityState.DISARMED:
+            priority_results.append(security)
+        if arrival.category is ArrivalState.RECENT:
+            priority_results.append(arrival)
+        if media.is_known and media.category is not MediaState.IDLE:
+            priority_results.append(media)
+        if weather_daylight.is_known:
+            priority_results.append(weather_daylight)
+        if security.category is SecurityState.DISARMED:
+            priority_results.append(security)
+        if media.category is MediaState.IDLE:
+            priority_results.append(media)
+        if household.is_known:
+            priority_results.append(household)
+        if opening.is_known:
+            priority_results.append(opening)
+
         available_intents = tuple(
             intent
-            for intent in (
-                *security.semantic_intents,
-                *media.semantic_intents,
-                *opening.semantic_intents,
-            )
+            for result in priority_results
+            for intent in result.semantic_intents
             if intent is not SemanticIntent.UNKNOWN
         )
         semantic_intents = _unique(available_intents or (SemanticIntent.UNKNOWN,))
-        primary = semantic_intents[0] if semantic_intents else SemanticIntent.UNKNOWN
-        reasons = (*security.reasons, *media.reasons, *opening.reasons)
-        known_confidences = [
-            result.confidence
-            for result in (security, media, opening)
-            if result.is_known
-        ]
-        confidence = min(known_confidences) if known_confidences else 0.0
+        primary = semantic_intents[0]
+        confidence = priority_results[0].confidence if priority_results else 0.0
+        reasons = (
+            *security.reasons,
+            *sleep.reasons,
+            *arrival.reasons,
+            *media.reasons,
+            *weather_daylight.reasons,
+            *household.reasons,
+            *opening.reasons,
+        )
 
     provenance = tuple(
-        dict.fromkeys((*security.provenance, *media.provenance, *opening.provenance)),
+        dict.fromkeys(
+            (
+                *security.provenance,
+                *sleep.provenance,
+                *arrival.provenance,
+                *media.provenance,
+                *weather_daylight.provenance,
+                *household.provenance,
+                *opening.provenance,
+            ),
+        ),
     )
     return ContextClassification(
         security=security,
+        sleep=sleep,
+        arrival=arrival,
         media=media,
+        weather_daylight=weather_daylight,
+        household=household,
         opening=opening,
         semantic_intents=semantic_intents,
         primary_semantic_intent=primary,
@@ -771,6 +1427,38 @@ def classify_opening(
     return classify_opening_state(snapshot)
 
 
+def classify_weather(
+    snapshot: StateSnapshot | Mapping[str, object],
+) -> WeatherDaylightClassification:
+    """Short alias for :func:`classify_weather_daylight`."""
+    return classify_weather_daylight(snapshot)
+
+
+def classify_household(
+    snapshot: StateSnapshot | Mapping[str, object],
+) -> HouseholdClassification:
+    """Short alias for :func:`classify_household_state`."""
+    return classify_household_state(snapshot)
+
+
+def classify_arrival(
+    snapshot: StateSnapshot | Mapping[str, object],
+    *,
+    observed_at: object | None = None,
+    age_seconds: object | None = None,
+    max_age_seconds: object | None = None,
+    now: object | None = None,
+) -> ArrivalClassification:
+    """Short alias for :func:`classify_arrival_state`."""
+    return classify_arrival_state(
+        snapshot,
+        observed_at=observed_at,
+        age_seconds=age_seconds,
+        max_age_seconds=max_age_seconds,
+        now=now,
+    )
+
+
 def classify_snapshot(
     snapshot: StateSnapshot | Mapping[str, object],
 ) -> ContextClassification:
@@ -779,8 +1467,12 @@ def classify_snapshot(
 
 
 __all__ = [
+    "ArrivalClassification",
+    "ArrivalState",
     "Classification",
     "ContextClassification",
+    "HouseholdClassification",
+    "HouseholdState",
     "MediaClassification",
     "MediaState",
     "OpeningClassification",
@@ -788,13 +1480,24 @@ __all__ = [
     "SecurityClassification",
     "SecurityState",
     "SemanticIntent",
+    "SleepClassification",
+    "SleepState",
     "StateSnapshot",
+    "WeatherDaylightClassification",
+    "WeatherDaylightState",
+    "classify_arrival",
+    "classify_arrival_state",
     "classify_context",
+    "classify_household",
+    "classify_household_state",
     "classify_media",
     "classify_media_state",
     "classify_opening",
     "classify_opening_state",
     "classify_security",
     "classify_security_state",
+    "classify_sleep_state",
     "classify_snapshot",
+    "classify_weather",
+    "classify_weather_daylight",
 ]
