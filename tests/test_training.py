@@ -8,6 +8,7 @@ from homeassistant.components.adaptive_lighting.training import (
     DAY_TYPE_PUBLIC_HOLIDAY,
     DAY_TYPE_WEEKDAY,
     DAY_TYPE_WEEKEND,
+    MAX_BEHAVIOR_SAMPLES_PER_SESSION,
     PHASE_ACTIVE,
     PHASE_SHADOW_LEARNING,
     AdaptiveLightingTraining,
@@ -308,5 +309,115 @@ async def test_listener_receives_learning_and_phase_changes(hass) -> None:
     assert any(change["sample_counts"]["accepted"] == 1 for change in changes)
     assert changes[-1]["phase"] == PHASE_ACTIVE
     json.dumps(changes[-1])
+
+    await training.async_unload()
+
+
+async def test_on_off_behavior_counts_for_commissioning_and_deduplicates(hass) -> None:
+    """Non-dimmable light choices contribute without inventing brightness."""
+    training = await make_training(hass, minimum_samples=1)
+    observed_at = training.training_started_at
+    observation = {
+        "entity_id": "light.hallway",
+        "action": "off",
+        "timestamp": observed_at,
+        "source": "physical",
+        "provenance": "human",
+        "semantic_routine": "ambient",
+        "day_type": DAY_TYPE_WEEKDAY,
+    }
+
+    assert await training.async_record_behavior_observation(
+        observation,
+        now=observed_at,
+    )
+    assert not await training.async_record_behavior_observation(
+        observation,
+        now=observed_at,
+    )
+    assert training.sample_counts["accepted"] == 1
+    assert training.sample_counts["behavior_accepted"] == 1
+    assert training.last_sample["kind"] == "on_off_behavior"
+    assert training.learner.sample_count == 0
+
+    await training.async_unload()
+
+
+async def test_good_night_behavior_counts_but_alarm_behavior_does_not(hass) -> None:
+    """Good Night is a routine preference; safety actions are never targets."""
+    training = await make_training(hass)
+    observed_at = training.training_started_at
+    common = {
+        "entity_id": "light.hallway",
+        "action": "off",
+        "timestamp": observed_at,
+        "source": "automation.good_night",
+        "provenance": "automation",
+        "semantic_routine": "good_night",
+        "day_type": DAY_TYPE_WEEKDAY,
+    }
+
+    assert await training.async_record_behavior_observation(common, now=observed_at)
+    assert not await training.async_record_behavior_observation(
+        {
+            **common,
+            "timestamp": observed_at + timedelta(seconds=1),
+            "source": "fire_alarm",
+            "provenance": "security_event",
+        },
+        now=observed_at + timedelta(seconds=1),
+    )
+    assert training.sample_counts["behavior_accepted"] == 1
+
+    await training.async_unload()
+
+
+async def test_behavior_commissioning_rejects_out_of_session_and_future_events(
+    hass,
+) -> None:
+    """Old/future observations cannot inflate the persisted promotion gate."""
+    training = await make_training(hass)
+    started = training.training_started_at
+    common = {
+        "entity_id": "light.hallway",
+        "action": "on",
+        "source": "physical",
+        "provenance": "human",
+        "semantic_routine": "ambient",
+    }
+
+    assert not await training.async_record_behavior_observation(
+        {**common, "timestamp": started - timedelta(seconds=1)},
+        now=started,
+    )
+    assert not await training.async_record_behavior_observation(
+        {**common, "timestamp": started + timedelta(seconds=31)},
+        now=started,
+    )
+    assert training.sample_count == 0
+
+    await training.async_unload()
+
+
+async def test_behavior_commissioning_ledger_fails_closed_at_bound(hass) -> None:
+    """A full fingerprint ledger refuses new counts instead of evicting IDs."""
+    training = await make_training(hass)
+    started = training.training_started_at
+    training._behavior_sample_ids = [
+        f"{index:032x}" for index in range(MAX_BEHAVIOR_SAMPLES_PER_SESSION)
+    ]
+
+    assert not await training.async_record_behavior_observation(
+        {
+            "entity_id": "light.hallway",
+            "action": "on",
+            "timestamp": started,
+            "source": "physical",
+            "provenance": "human",
+            "semantic_routine": "ambient",
+        },
+        now=started,
+    )
+    assert training.sample_count == 0
 
     await training.async_unload()

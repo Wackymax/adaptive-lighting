@@ -10,6 +10,7 @@ inspected without granting the training code an actuation path.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -39,6 +40,8 @@ DEFAULT_TRAINING_DURATION_DAYS = 7
 DEFAULT_DURABILITY_SECONDS = 30.0
 DEFAULT_MINIMUM_SAMPLES = 5
 DEFAULT_MINIMUM_CONFIDENCE = 0.75
+MAX_BEHAVIOR_SAMPLES_PER_SESSION = 20_000
+BEHAVIOR_CLOCK_SKEW_SECONDS = 30
 DAY_TYPE_WEEKDAY = "weekday"
 DAY_TYPE_WEEKEND = "weekend"
 DAY_TYPE_PUBLIC_HOLIDAY = "public_holiday"
@@ -441,6 +444,8 @@ class AdaptiveLightingTraining:
         self._accepted_count = 0
         self._rejected_count = 0
         self._superseded_count = 0
+        self._behavior_accepted_count = 0
+        self._behavior_sample_ids: list[str] = []
         self._day_type_counts: dict[str, int] = {}
         self._pending: dict[str, dict[str, Any]] = {}
         self._pending_timers: dict[str, Callable[[], None]] = {}
@@ -517,6 +522,7 @@ class AdaptiveLightingTraining:
         """Return compact counts suitable for a diagnostics sensor."""
         return {
             "accepted": self._accepted_count,
+            "behavior_accepted": self._behavior_accepted_count,
             "rejected": self._rejected_count,
             "superseded": self._superseded_count,
             "pending": len(self._pending),
@@ -702,6 +708,8 @@ class AdaptiveLightingTraining:
         self._accepted_count = 0
         self._rejected_count = 0
         self._superseded_count = 0
+        self._behavior_accepted_count = 0
+        self._behavior_sample_ids.clear()
         self._day_type_counts.clear()
         self._pending.clear()
         self._learner.reset()
@@ -742,6 +750,20 @@ class AdaptiveLightingTraining:
         self._accepted_count = max(0, _stored_int(counts.get("accepted")))
         self._rejected_count = max(0, _stored_int(counts.get("rejected")))
         self._superseded_count = max(0, _stored_int(counts.get("superseded")))
+        self._behavior_accepted_count = min(
+            self._accepted_count,
+            max(0, _stored_int(counts.get("behavior_accepted"))),
+        )
+        behavior_sample_ids = data.get("behavior_sample_ids", [])
+        self._behavior_sample_ids = (
+            [
+                value
+                for value in behavior_sample_ids[:MAX_BEHAVIOR_SAMPLES_PER_SESSION]
+                if isinstance(value, str) and 0 < len(value) <= 64
+            ]
+            if isinstance(behavior_sample_ids, list)
+            else []
+        )
         day_type_counts = data.get("day_type_counts", {})
         self._day_type_counts = (
             {
@@ -840,6 +862,7 @@ class AdaptiveLightingTraining:
             "day_type_counts": self.day_type_counts,
             "last_sample": _json_safe(self._last_sample),
             "last_rejection_reason": self._last_rejection_reason,
+            "behavior_sample_ids": list(self._behavior_sample_ids),
             "pending": self._export_pending(),
         }
 
@@ -903,6 +926,7 @@ class AdaptiveLightingTraining:
             self._accepted_count,
             self._rejected_count,
             self._superseded_count,
+            self._behavior_accepted_count,
             len(self._pending),
             self._promotion_reason,
             self._last_rejection_reason,
@@ -1195,6 +1219,105 @@ class AdaptiveLightingTraining:
         """Queue a candidate and return whether it passed admission checks."""
         result = await self.async_ingest_candidate(sample, now=now)
         return bool(result.get("queued") or result.get("accepted"))
+
+    async def async_record_behavior_observation(
+        self,
+        observation: Mapping[str, Any] | Any,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Count one normalized on/off observation toward commissioning.
+
+        The temporal behavior model owns the observation's statistical weight.
+        This method only lets on/off-only fixtures contribute to the same
+        persisted seven-day commissioning gate as brightness corrections.  A
+        bounded fingerprint prevents event replay after restart from inflating
+        the global promotion count.
+        """
+        if not self._loaded:
+            await self.async_setup()
+        if self._unloaded:
+            return False
+        if isinstance(observation, Mapping):
+            data = dict(observation)
+        else:
+            fields = (
+                "entity_id",
+                "action",
+                "timestamp",
+                "source",
+                "provenance",
+                "semantic_routine",
+                "day_type",
+            )
+            data = {name: getattr(observation, name, None) for name in fields}
+
+        entity_id = _text(data.get("entity_id"))
+        action = _text(data.get("action"))
+        observed_at = _parse_datetime(data.get("timestamp"))
+        source = _marker_text(data.get("source"))
+        provenance = _marker_text(data.get("provenance"))
+        routine = _marker_text(data.get("semantic_routine"))
+        labels = (source, provenance, routine)
+        safety = any(
+            marker in label
+            for label in labels
+            for marker in _SAFETY_MARKERS - {"goodnight"}
+        )
+        human = any(
+            label in {_marker_text(item) for item in _HUMAN_SOURCES}
+            for label in (source, provenance)
+        )
+        good_night = routine == "goodnight"
+        current = _as_utc(now) if now is not None else self._current_time()
+        if (
+            not entity_id
+            or action not in {"on", "off"}
+            or observed_at is None
+            or self._phase != PHASE_SHADOW_LEARNING
+            or self._training_started_at is None
+            or observed_at < self._training_started_at
+            or observed_at > current + timedelta(seconds=BEHAVIOR_CLOCK_SKEW_SECONDS)
+            or safety
+            or not (human or good_night)
+        ):
+            return False
+
+        raw_id = f"{entity_id}|{action}|{observed_at.isoformat()}"
+        sample_id = hashlib.sha256(raw_id.encode()).hexdigest()[:32]
+        if sample_id in self._behavior_sample_ids:
+            return False
+        # Never evict commissioning fingerprints: forgetting one would let a
+        # recorder replay inflate the promotion gate.  At the explicit bound,
+        # fail closed and keep learning only in the separate temporal model.
+        if len(self._behavior_sample_ids) >= MAX_BEHAVIOR_SAMPLES_PER_SESSION:
+            return False
+
+        before = self._state_signature()
+        day_type = _text(data.get("day_type"))
+        if day_type not in VALID_DAY_TYPES:
+            day_type = self._resolve_day_type(observed_at, data)
+        self._behavior_sample_ids.append(sample_id)
+        self._accepted_count += 1
+        self._behavior_accepted_count += 1
+        self._day_type_counts[day_type] = self._day_type_counts.get(day_type, 0) + 1
+        self._last_sample = {
+            "kind": "on_off_behavior",
+            "entity_id": entity_id,
+            "action": action,
+            "day_type": day_type,
+            "semantic_routine": "good_night" if good_night else routine,
+            "observed_at": observed_at.isoformat(),
+        }
+        self._last_rejection_reason = None
+        if (
+            self._phase == PHASE_SHADOW_LEARNING
+            and self._training_deadline is not None
+            and current >= self._training_deadline
+        ):
+            self._evaluate_promotion()
+        await self._persist_and_notify(before)
+        return True
 
     async_add_sample = async_ingest_sample
     async_record_sample = async_ingest_sample
