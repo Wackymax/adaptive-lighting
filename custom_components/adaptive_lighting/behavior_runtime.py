@@ -46,7 +46,7 @@ from .temporal_model import (
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
-DATA_VERSION = 1
+DATA_VERSION = 2
 DEFAULT_STORAGE_KEY = "adaptive_lighting_behavior_runtime"
 MAX_ENTITIES = 128
 MAX_DIAGNOSTIC_DECISIONS = 32
@@ -58,6 +58,8 @@ DEFAULT_EMPTY_DWELL = timedelta(minutes=5)
 DEFAULT_OBSERVATION_WINDOW = timedelta(hours=1)
 DEFAULT_CORRECTION_WINDOW = timedelta(minutes=15)
 DEFAULT_CORRECTION_SUPPRESSION = timedelta(minutes=30)
+DEFAULT_MANUAL_ACTION_HOLD = timedelta(minutes=30)
+MAX_MANUAL_ACTION_HOLD = timedelta(days=7)
 
 _LIGHT_DOMAINS = frozenset({"light", "switch"})
 _BLOCKED_DOMAINS = frozenset(
@@ -241,6 +243,7 @@ class _EntityRecord:
     last_access: int = 0
     sample_count: int = 0
     candidate: CandidateRecord | None = None
+    last_human_action_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +457,7 @@ class BehaviorRuntimeAdapter:
         observation_window: timedelta | float = DEFAULT_OBSERVATION_WINDOW,
         correction_window: timedelta | float = DEFAULT_CORRECTION_WINDOW,
         correction_suppression: timedelta | float = DEFAULT_CORRECTION_SUPPRESSION,
+        manual_action_hold: timedelta | float = DEFAULT_MANUAL_ACTION_HOLD,
         empty_dwell: timedelta | float = DEFAULT_EMPTY_DWELL,
         min_probability: float = 0.90,
         min_confidence: float = 0.75,
@@ -498,6 +502,14 @@ class BehaviorRuntimeAdapter:
             correction_suppression,
             "correction_suppression",
         )
+        self.manual_action_hold = self._duration(
+            manual_action_hold,
+            "manual_action_hold",
+        )
+        if self.manual_action_hold > MAX_MANUAL_ACTION_HOLD:
+            raise ValueError(
+                f"manual_action_hold must not exceed {MAX_MANUAL_ACTION_HOLD.days} days"
+            )
         self.empty_dwell = self._duration(empty_dwell, "empty_dwell")
         self.context_max_age = self._duration(context_max_age, "context_max_age")
         self.min_probability = float(min_probability)
@@ -1249,7 +1261,19 @@ class BehaviorRuntimeAdapter:
         if not result.accepted or result.observation is None:
             self._last_rejection_reason = result.reason
             return False
-        return await self._learn_observation(record, result.observation, mapping)
+        learned = await self._learn_observation(record, result.observation, mapping)
+        if (
+            learned
+            and semantic_routine != "good_night"
+            and _words(f"{source} {provenance}").intersection(_HUMAN_WORDS)
+        ):
+            observed_at = _utc(result.observation.timestamp)
+            if (
+                record.last_human_action_at is None
+                or observed_at > record.last_human_action_at
+            ):
+                record.last_human_action_at = observed_at
+        return learned
 
     async def _learn_observation(
         self,
@@ -1704,6 +1728,7 @@ class BehaviorRuntimeAdapter:
                 "removed_at",
                 "last_access",
                 "sample_count",
+                "last_human_action_at",
                 "model",
             }
             if set(raw) != expected or raw["entity_id"] != entity_id:
@@ -1727,6 +1752,11 @@ class BehaviorRuntimeAdapter:
                 if raw["removed_at"] is None
                 else self._parse_stored_time(raw["removed_at"])
             )
+            last_human_action_at = (
+                None
+                if raw["last_human_action_at"] is None
+                else self._parse_stored_time(raw["last_human_action_at"])
+            )
             if type(raw["last_access"]) is not int or raw["last_access"] < 0:
                 raise ValueError("invalid behavior runtime access")
             if (
@@ -1747,6 +1777,7 @@ class BehaviorRuntimeAdapter:
                 raw["last_access"],
                 raw["sample_count"],
                 None,
+                last_human_action_at,
             )
         self._entities = restored
         self._counter = counter
@@ -1781,6 +1812,11 @@ class BehaviorRuntimeAdapter:
                     ),
                     "last_access": record.last_access,
                     "sample_count": record.sample_count,
+                    "last_human_action_at": (
+                        record.last_human_action_at.isoformat().replace("+00:00", "Z")
+                        if record.last_human_action_at is not None
+                        else None
+                    ),
                     "model": record.model.to_dict(),
                 }
                 for entity_id, record in sorted(self._entities.items())
@@ -1984,9 +2020,14 @@ class BehaviorRuntimeAdapter:
             action = "on" if current == STATE_OFF else "off"
             entity_context = self._context_for_area(context_mapping, record.area)
             gate_reason = (
-                "manual_hold_entity"
-                if candidate.manual_hold
-                else self._gate_reason(action, entity_context, at)
+                "recent_manual_action"
+                if record.last_human_action_at is not None
+                and at < record.last_human_action_at + self.manual_action_hold
+                else (
+                    "manual_hold_entity"
+                    if candidate.manual_hold
+                    else self._gate_reason(action, entity_context, at)
+                )
             )
             temporal = self._temporal_context(
                 entity_context, entity_id, record.area, action

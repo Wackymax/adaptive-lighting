@@ -168,6 +168,19 @@ def _register_light_services(hass) -> None:
     hass.services.async_register("light", "turn_off", _turn_off)
 
 
+async def _set_automation_state(hass, entity_id: str, state: str) -> None:
+    """Set fixture state without manufacturing a second physical observation."""
+    hass.states.async_set(
+        entity_id,
+        state,
+        context=Context(
+            id=f"fixture-{uuid4().hex}",
+            parent_id=f"fixture-parent-{uuid4().hex}",
+        ),
+    )
+    await hass.async_block_till_done()
+
+
 def _light(entity_id: str = "light.living", **changes: object) -> CandidateRecord:
     value: dict[str, object] = {
         "entity_id": entity_id,
@@ -178,6 +191,171 @@ def _light(entity_id: str = "light.living", **changes: object) -> CandidateRecor
     }
     value.update(changes)
     return CandidateRecord(**value)
+
+
+def _light_switch(
+    entity_id: str = "switch.fixture",
+    **changes: object,
+) -> CandidateRecord:
+    value: dict[str, object] = {
+        "entity_id": entity_id,
+        "area": "living",
+        "domain": "switch",
+        "supports_brightness": False,
+        "available": True,
+        "explicit_light_switch": True,
+    }
+    value.update(changes)
+    return CandidateRecord(**value)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "entity_id"),
+    [
+        (_light(), "light.living"),
+        (_light_switch(), "switch.fixture"),
+    ],
+)
+async def test_recent_manual_action_holds_native_light_and_light_switch(
+    hass,
+    candidate: CandidateRecord,
+    entity_id: str,
+) -> None:
+    calls: list[Event] = []
+    context = _context()
+    hass.bus.async_listen(EVENT_CALL_SERVICE, calls.append)
+    runtime = await _runtime(
+        hass,
+        [candidate],
+        context=context,
+        actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(minutes=30),
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    await _transition(
+        runtime,
+        entity_id,
+        "off",
+        context=Context(id=f"manual-{entity_id}"),
+        old_state="on",
+    )
+    await _set_automation_state(hass, entity_id, "off")
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=1))
+    await hass.async_block_till_done()
+
+    assert proposals
+    assert proposals[0].reason == "recent_manual_action"
+    assert not proposals[0].ready
+    assert not proposals[0].executed
+    assert calls == []
+    assert runtime._entities[entity_id].last_human_action_at == BASE_TIME
+    await runtime.async_stop()
+
+
+async def test_manual_action_hold_expires_and_good_night_does_not_start_it(
+    hass,
+) -> None:
+    context = _context()
+    runtime = await _runtime(
+        hass,
+        [_light()],
+        context=context,
+        manual_action_hold=timedelta(minutes=30),
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    await _transition(
+        runtime,
+        "light.living",
+        "off",
+        context=Context(id="manual-off"),
+        old_state="on",
+    )
+    await _set_automation_state(hass, "light.living", "off")
+
+    held = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=29))
+    context["timestamp"] = BASE_TIME + timedelta(minutes=30)
+    expired = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=30))
+
+    assert held
+    assert held[0].reason == "recent_manual_action"
+    assert expired
+    assert expired[0].reason != "recent_manual_action"
+    await runtime.async_stop()
+
+    good_night_context = _context(
+        BASE_TIME + timedelta(hours=1),
+        semantic_routine="good_night",
+    )
+    good_night = await _runtime(
+        hass,
+        [_light()],
+        context=good_night_context,
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    await good_night.async_record_good_night(
+        ("light.living",),
+        context={
+            "timestamp": BASE_TIME + timedelta(hours=1),
+            "source": "scene.good_night",
+        },
+    )
+    await _set_automation_state(hass, "light.living", "on")
+
+    proposals = await good_night.async_evaluate(now=BASE_TIME + timedelta(hours=1))
+
+    assert good_night._entities["light.living"].last_human_action_at is None
+    assert proposals
+    assert proposals[0].reason == "ready_shadow"
+    await good_night.async_stop()
+
+
+async def test_manual_action_hold_survives_remove_readd_and_area_move(hass) -> None:
+    candidates = [_light()]
+    context = _context()
+    runtime = await _runtime(hass, candidates, context=context)
+    await _transition(
+        runtime,
+        "light.living",
+        "off",
+        context=Context(id="manual-before-move"),
+        old_state="on",
+    )
+    candidates.clear()
+    await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=1))
+    candidates.append(_light(area="kitchen"))
+    await _set_automation_state(hass, "light.living", "off")
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=2))
+
+    assert proposals
+    assert proposals[0].reason == "recent_manual_action"
+    assert runtime._entities["light.living"].area == "kitchen"
+    assert runtime._entities["light.living"].last_human_action_at == BASE_TIME
+    await runtime.async_stop()
+
+
+@pytest.mark.parametrize(
+    "hold",
+    [timedelta(0), timedelta(days=8)],
+)
+async def test_manual_action_hold_must_be_positive_and_bounded(hass, hold) -> None:
+    with pytest.raises(ValueError, match="manual_action_hold"):
+        BehaviorRuntimeAdapter(
+            hass,
+            candidate_provider=lambda: (),
+            context_provider=_context,
+            manual_action_hold=hold,
+        )
 
 
 async def test_shadow_learning_has_no_service_calls_and_counts_human_actions(
@@ -229,6 +407,7 @@ async def test_non_dimmable_active_action_uses_small_turn_on_service(hass) -> No
         [_light()],
         context=context,
         actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -242,8 +421,7 @@ async def test_non_dimmable_active_action_uses_small_turn_on_service(hass) -> No
             at=BASE_TIME + timedelta(minutes=index),
             context=Context(user_id=f"person-{index}"),
         )
-    hass.states.async_set("light.living", "off")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "off")
     context["timestamp"] = BASE_TIME + timedelta(minutes=24)
     proposals = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=24))
     await hass.async_block_till_done()
@@ -270,6 +448,7 @@ async def test_failed_actuation_never_registers_or_settles_pending(hass) -> None
         [_light()],
         context=context,
         actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -312,6 +491,7 @@ async def test_success_without_state_confirmation_has_no_pending_reward(hass) ->
         [_light()],
         context=context,
         actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -351,6 +531,7 @@ async def test_quick_reversal_suppresses_pending_proposal(hass) -> None:
         [_light()],
         context=context,
         actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -364,8 +545,7 @@ async def test_quick_reversal_suppresses_pending_proposal(hass) -> None:
             at=training_start + timedelta(minutes=index),
             context=Context(user_id=f"person-{index}"),
         )
-    hass.states.async_set("light.living", "off")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "off")
     proposals = await runtime.async_evaluate(now=proposal_at)
     await hass.async_block_till_done()
     assert proposals
@@ -403,6 +583,7 @@ async def test_late_opposite_feedback_is_negative_without_suppression(hass) -> N
         [_light()],
         context=context,
         actuation_enabled=lambda: True,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -451,6 +632,7 @@ async def test_own_state_change_does_not_consume_pending_proposal(hass) -> None:
         [_light()],
         context=context,
         actuation_enabled=True.__bool__,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -464,8 +646,7 @@ async def test_own_state_change_does_not_consume_pending_proposal(hass) -> None:
             at=BASE_TIME + timedelta(minutes=index),
             context=Context(user_id=f"person-{index}"),
         )
-    hass.states.async_set("light.living", "off")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "off")
     await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=7))
     await hass.async_block_till_done()
     assert runtime.models["light.living"].pending_proposal_count == 1, (
@@ -795,8 +976,7 @@ async def test_good_night_is_learnable_but_unknown_occupancy_does_not_allow_off(
         context={"timestamp": BASE_TIME, "source": "scene.good_night"},
     )
     assert len(accepted) == 1
-    hass.states.async_set("light.living", "on")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "on")
     proposals = await runtime.async_evaluate(now=BASE_TIME)
     assert proposals
     assert proposals[0].reason == "off_requires_good_night_away_or_empty_dwell"
@@ -814,8 +994,13 @@ async def test_on_requires_home_and_occupancy_or_fresh_arrival(hass) -> None:
         min_effective_support=0.1,
         min_freshness=0.0,
     )
-    hass.states.async_set("light.living", "off")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "off")
+    runtime.models["light.living"].update(
+        runtime._temporal_context(context, "light.living", "living", "on"),
+        "on",
+        True,
+        provenance="user",
+    )
     proposals = await runtime.async_evaluate(now=BASE_TIME)
     assert proposals
     assert proposals[0].reason == "household_not_home"
@@ -870,6 +1055,7 @@ async def test_candidate_manual_hold_blocks_actuation_but_not_learning(hass) -> 
         context=context,
         actuation_enabled=lambda: True,
         on_accepted_observation=accepted.append,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -879,7 +1065,8 @@ async def test_candidate_manual_hold_blocks_actuation_but_not_learning(hass) -> 
         _state_event("light.living", "on", context=Context(id="physical-device")),
     )
 
-    proposals = await runtime.async_evaluate(now=BASE_TIME)
+    context["timestamp"] = BASE_TIME + timedelta(minutes=1)
+    proposals = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=1))
 
     assert len(accepted) == 1
     assert proposals
@@ -910,6 +1097,7 @@ async def test_area_occupancy_cannot_authorize_another_area_light(hass) -> None:
             _light("light.bedroom", area="bedroom"),
         ],
         context=context,
+        manual_action_hold=timedelta(seconds=30),
         min_probability=0.0,
         min_confidence=0.0,
         min_effective_support=0.1,
@@ -923,7 +1111,8 @@ async def test_area_occupancy_cannot_authorize_another_area_light(hass) -> None:
     )
     runtime._states.update({"light.kitchen": "off", "light.bedroom": "off"})
 
-    proposals = await runtime.async_evaluate(now=BASE_TIME)
+    context["timestamp"] = BASE_TIME + timedelta(minutes=1)
+    proposals = await runtime.async_evaluate(now=BASE_TIME + timedelta(minutes=1))
     by_entity = {proposal.entity_id: proposal for proposal in proposals}
 
     assert by_entity["light.kitchen"].reason == "ready_shadow"
@@ -1032,8 +1221,7 @@ async def test_state_order_hass_preference_and_readd_clear_stale_cache(hass) -> 
     assert len(accepted) == 1
     assert runtime._states["light.living"] == "on"
 
-    hass.states.async_set("light.living", "off")
-    await hass.async_block_till_done()
+    await _set_automation_state(hass, "light.living", "off")
     runtime._states["light.living"] = "on"
     proposals = await runtime.async_evaluate(now=BASE_TIME)
     assert proposals
@@ -1053,10 +1241,12 @@ async def test_state_order_hass_preference_and_readd_clear_stale_cache(hass) -> 
 async def test_persistence_roundtrip_and_corrupt_reset(hass) -> None:
     key = f"adaptive_lighting_behavior_persistence_{uuid4().hex}"
     candidates = [_light()]
+    action_at = dt_util.utcnow()
+    context = _context(action_at + timedelta(minutes=1))
     runtime = BehaviorRuntimeAdapter(
         hass,
         candidate_provider=lambda: tuple(candidates),
-        context_provider=lambda: _context(),
+        context_provider=lambda: dict(context),
         storage_key=key,
     )
     _ACTIVE_RUNTIMES.add(runtime)
@@ -1065,27 +1255,51 @@ async def test_persistence_roundtrip_and_corrupt_reset(hass) -> None:
         runtime,
         "light.living",
         "on",
+        at=action_at,
         context=Context(user_id="person"),
     )
     exported = await runtime._store.async_load()
     json.dumps(exported)
+    assert exported is not None
+    assert exported["entities"]["light.living"]["last_human_action_at"] == (
+        action_at.isoformat().replace("+00:00", "Z")
+    )
     await runtime.async_stop()
 
     restored = BehaviorRuntimeAdapter(
         hass,
         candidate_provider=lambda: tuple(candidates),
-        context_provider=lambda: _context(),
+        context_provider=lambda: dict(context),
         storage_key=key,
     )
     await restored.async_start()
+    await _set_automation_state(hass, "light.living", "on")
+    held = await restored.async_evaluate(now=action_at + timedelta(minutes=1))
     assert restored.diagnostics["accepted_observations"] == 1
+    assert held
+    assert held[0].reason == "recent_manual_action"
     await restored.async_stop()
+
+    corrupt = json.loads(json.dumps(exported))
+    del corrupt["entities"]["light.living"]["last_human_action_at"]
+    await restored._store.async_save(corrupt)
+    strict_reset = BehaviorRuntimeAdapter(
+        hass,
+        candidate_provider=lambda: tuple(candidates),
+        context_provider=lambda: dict(context),
+        storage_key=key,
+    )
+    await strict_reset.async_start()
+    assert strict_reset.diagnostics["last_load_reset_reason"] == "corrupt_state"
+    assert strict_reset.diagnostics["accepted_observations"] == 0
+    await strict_reset.async_stop()
+
     await restored._store.async_save({"data_version": 999})
 
     reset = BehaviorRuntimeAdapter(
         hass,
         candidate_provider=lambda: tuple(candidates),
-        context_provider=lambda: _context(),
+        context_provider=lambda: dict(context),
         storage_key=key,
     )
     await reset.async_start()
