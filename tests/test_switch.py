@@ -476,6 +476,7 @@ async def test_shadow_intelligence_skips_initial_and_reactivation_light_calls(ha
     ]
     assert not light_turn_on_calls
     assert switch._intelligence_decisions
+    assert switch.adapt_color_switch.is_on is False
 
 
 def async_process_ha_core_config(hass, config):
@@ -1574,6 +1575,26 @@ async def test_restore_off_state(hass, state):
                     assert _switch.is_on
                 else:
                     assert not _switch.is_on
+
+
+async def test_intelligence_shadow_color_ignores_stale_on_restore(hass):
+    """Shadow commissioning keeps color off even after an old restored-on state."""
+    with patch(
+        "homeassistant.helpers.restore_state.RestoreEntity.async_get_last_state",
+        return_value=State(ENTITY_SWITCH, STATE_ON),
+    ):
+        await hass.async_start()
+        await hass.async_block_till_done()
+        _, switch = await setup_switch(
+            hass,
+            {
+                CONF_INTELLIGENCE_ENABLED: True,
+                CONF_INTELLIGENCE_SHADOW_MODE: True,
+            },
+        )
+
+    assert switch.adapt_color_switch.is_on is False
+    assert switch.adapt_brightness_switch.is_on is True
 
 
 async def test_offset_too_large(hass):

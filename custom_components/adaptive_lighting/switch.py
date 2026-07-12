@@ -777,6 +777,11 @@ async def async_setup_entry(  # noqa: PLR0915
         manager = AdaptiveLightingManager(hass)
         data[ATTR_ADAPTIVE_LIGHTING_MANAGER] = manager
 
+    entry_settings = validate(config_entry)
+    intelligence_shadow = bool(
+        entry_settings[CONF_INTELLIGENCE_ENABLED]
+        and entry_settings[CONF_INTELLIGENCE_SHADOW_MODE],
+    )
     sleep_mode_switch = SimpleSwitch(
         which="Sleep Mode",
         initial_state=False,
@@ -786,7 +791,10 @@ async def async_setup_entry(  # noqa: PLR0915
     )
     adapt_color_switch = SimpleSwitch(
         which="Adapt Color",
-        initial_state=True,
+        # A stale restore record must not re-enable deterministic color
+        # adaptation while the intelligence layer is commissioned in shadow.
+        initial_state=not intelligence_shadow,
+        restore_state=not intelligence_shadow,
         hass=hass,
         config_entry=config_entry,
         icon=ICON_COLOR_TEMP,
@@ -3946,6 +3954,7 @@ class SimpleSwitch(SwitchEntity, RestoreEntity):
         hass: HomeAssistant,
         config_entry: ConfigEntry,
         icon: str,
+        restore_state: bool = True,
     ) -> None:
         """Initialize the Adaptive Lighting switch."""
         self.hass = hass
@@ -3957,6 +3966,7 @@ class SimpleSwitch(SwitchEntity, RestoreEntity):
         self._unique_id = f"{self._config_name}_{slugify(self._which)}"
         self._name = f"Adaptive Lighting {which}: {self._config_name}"
         self._initial_state = initial_state
+        self._restore_state = restore_state
 
     @property
     def name(self) -> str:
@@ -3991,6 +4001,12 @@ class SimpleSwitch(SwitchEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to hass."""
+        if not self._restore_state:
+            if self._initial_state:
+                await self.async_turn_on()
+            else:
+                await self.async_turn_off()
+            return
         last_state = await self.async_get_last_state()
         _LOGGER.debug("%s: last state is %s", self._name, last_state)
         if (last_state is None and self._initial_state) or (
