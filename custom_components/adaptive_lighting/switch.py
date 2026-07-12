@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import math
 import zoneinfo
 from collections.abc import Mapping
 from copy import deepcopy
@@ -83,6 +84,7 @@ from .adaptation_utils import (
     manual_control_event_attribute_to_flags,
     prepare_adaptation_data,
 )
+from .behavior_runtime import BehaviorRuntimeAdapter, CandidateRecord
 from .color_and_brightness import SunLightSettings
 from .const import (
     ADAPT_BRIGHTNESS_SWITCH,
@@ -177,10 +179,14 @@ from .const import (
 )
 from .context import ContextSignal, ContextSnapshot
 from .context_classification import (
+    ArrivalState,
     MediaState,
     SecurityState,
+    classify_arrival_state,
+    classify_household_state,
     classify_media_state,
     classify_security_state,
+    classify_weather_daylight,
 )
 from .discovery import EntityDiscoveryCoordinator, InventorySnapshot
 from .hass_utils import area_entities, setup_service_call_interceptor
@@ -1134,6 +1140,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._name = data[CONF_NAME]
         self._interval: timedelta = data[CONF_INTERVAL]
         self.lights: list[str] = data[CONF_LIGHTS]
+        self._behavior_configured_lights = frozenset(self.lights)
 
         # backup data for use in change_switch_settings "configuration" CONF_USE_DEFAULTS
         self._config_backup = deepcopy(data)
@@ -1151,22 +1158,26 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._intelligence_decisions: dict[str, dict[str, Any]] = {}
         self._discovery_snapshot: InventorySnapshot | None = None
         self._discovered_context_entities: dict[str, list[str]] = {}
+        self._behavior_runtime: BehaviorRuntimeAdapter | None = None
+        self._behavior_runtime_started = False
+        self._behavior_evaluate_task: asyncio.Task[None] | None = None
+        self._behavior_abort_cleanup_task: asyncio.Task[None] | None = None
+        self._intelligence_teardown_started = False
         configured_context_ids = [
             entity_id
             for value in self._intelligence_entities.values()
             for entity_id in (value if isinstance(value, list) else [value])
             if entity_id
         ]
-        self._discovery = (
-            EntityDiscoveryCoordinator(
-                hass,
-                seed_entity_ids=[*self.lights, *configured_context_ids],
-                explicit_controlled_entity_ids=self.lights,
-                on_change=self._async_discovery_changed,
-            )
-            if self._intelligence_enabled
-            else None
-        )
+        self._discovery = None
+        if self._intelligence_enabled:
+            discovery_kwargs = {
+                "seed_entity_ids": [*self.lights, *configured_context_ids],
+                "explicit_controlled_entity_ids": self.lights,
+                "include_all_areas": True,
+                "on_change": self._async_discovery_changed,
+            }
+            self._discovery = EntityDiscoveryCoordinator(hass, **discovery_kwargs)
         training_config = self._intelligence_training_config
         self._training = (
             AdaptiveLightingTraining(
@@ -1183,6 +1194,19 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             if self._intelligence_enabled and training_config["enabled"]
             else None
         )
+        if self._intelligence_enabled and self._training is not None:
+            self._behavior_runtime = BehaviorRuntimeAdapter(
+                hass,
+                storage_key=(
+                    f"adaptive_lighting_behavior_runtime_{slugify(self._name)}"
+                ),
+                candidate_provider=self._behavior_candidates,
+                context_provider=self._behavior_context,
+                actuation_enabled=self._behavior_actuation_enabled,
+                phase_provider=self._behavior_phase,
+                on_change=self._async_behavior_changed,
+                on_accepted_observation=self._async_behavior_observation_accepted,
+            )
 
         # Set and unset tracker in async_turn_on and async_turn_off
         self.remove_listeners: list[CALLBACK_TYPE] = []
@@ -1360,10 +1384,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         capability_map = {
             CONF_OCCUPANCY_ENTITIES: {"motion", "occupancy"},
             CONF_PRESENCE_ENTITIES: {"presence", "household_presence"},
+            "household_presence": {"household_presence"},
             CONF_ILLUMINANCE_ENTITIES: {"illuminance"},
             CONF_MEDIA_ENTITIES: {"media"},
             "openings": {"opening", "door", "window", "garage_door"},
-            "weather": {"weather", "daylight_proxy"},
+            "weather": {"weather"},
+            "daylight": {"sun", "illuminance"},
+            "solar": {"solar_proxy"},
             "holidays": {"holiday_calendar"},
             "arrivals": {"arrival"},
             "security": {"security"},
@@ -1376,6 +1403,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             )
             for name, capabilities in capability_map.items()
         }
+        self._schedule_behavior_evaluation()
         if self.is_on:
             self._setup_intelligence_context_listener()
         if (
@@ -1384,6 +1412,1005 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             and self.hass.states.get(self.entity_id)
         ):
             self.async_write_ha_state()
+
+    @staticmethod
+    def _behavior_state_available(state: State | None) -> bool:
+        """Return whether a live HA state can be used by behavior runtime."""
+        return state is not None and state.state not in {"unknown", "unavailable"}
+
+    def _behavior_candidates(  # noqa: PLR0912, PLR0915
+        self,
+    ) -> tuple[CandidateRecord, ...]:
+        """Return one bounded, explicitly permitted candidate per fixture."""
+        snapshot = self._discovery_snapshot
+        registry = entity_registry.async_get(self.hass)
+        eligible: dict[str, tuple[CandidateRecord, str | None, str | None]] = {}
+        selected_entity_ids: set[str] = set()
+
+        def is_integration_light_group(entity_id: str) -> bool:
+            entry = registry.async_get(entity_id)
+            state = self.hass.states.get(entity_id)
+            members = state.attributes.get(ATTR_ENTITY_ID) if state else None
+            return bool(
+                (entry is not None and entry.platform == "group")
+                or (isinstance(members, (list, tuple, set, frozenset)) and members),
+            )
+
+        def add_candidate(
+            item: Any,
+            *,
+            device_id: str | None = None,
+            fallback: bool = False,
+        ) -> None:
+            entity_id = getattr(item, "entity_id", None)
+            domain = getattr(item, "domain", None)
+            capabilities = set(getattr(item, "capabilities", ()))
+            available = bool(getattr(item, "available", False))
+            if fallback:
+                state = self.hass.states.get(entity_id)
+                if not self._behavior_state_available(state):
+                    return
+                available = True
+            if not isinstance(entity_id, str) or domain not in {
+                LIGHT_DOMAIN,
+                SWITCH_DOMAIN,
+            }:
+                return
+            is_native_light = domain == LIGHT_DOMAIN and "on_off_light" in capabilities
+            is_light_switch = (
+                domain == SWITCH_DOMAIN and "light_like_switch" in capabilities
+            )
+            if not is_native_light and not is_light_switch:
+                return
+            if is_native_light and is_integration_light_group(entity_id):
+                return
+            try:
+                manual_hold = bool(
+                    self.manager.get_manual_control_attributes(entity_id).has_any(),
+                )
+            except Exception:  # noqa: BLE001 - fail closed for discovered entities
+                # A discovered entity may disappear while registry callbacks
+                # are reconciling. Keep it learnable, but fail closed in the
+                # runtime's per-entity actuation gate.
+                _LOGGER.warning(
+                    "%s: Could not read manual-control state for %s; "
+                    "behavior actuation will remain blocked",
+                    self._name,
+                    entity_id,
+                    exc_info=True,
+                )
+                manual_hold = True
+            candidate = CandidateRecord(
+                entity_id=entity_id,
+                area=(
+                    getattr(item, "area_name", None)
+                    or getattr(item, "area_id", None)
+                    or "unknown"
+                ),
+                domain=domain,
+                supports_brightness="dimmable_light" in capabilities,
+                available=available,
+                explicit_light_switch=is_light_switch,
+                manual_hold=manual_hold,
+            )
+            entry = registry.async_get(entity_id)
+            state = self.hass.states.get(entity_id)
+            raw_name = next(
+                (
+                    value
+                    for value in (
+                        state.attributes.get("friendly_name") if state else None,
+                        getattr(entry, "name", None),
+                        getattr(entry, "original_name", None),
+                        getattr(item, "name", None),
+                    )
+                    if isinstance(value, str) and value.strip()
+                ),
+                None,
+            )
+            normalized_name = (
+                " ".join(
+                    raw_name.casefold().replace("_", " ").replace("-", " ").split(),
+                )
+                if raw_name is not None
+                else None
+            )
+            dedupe_id = device_id or getattr(item, "device_id", None)
+            eligible[entity_id] = (candidate, dedupe_id, normalized_name)
+            selected_entity_ids.add(entity_id)
+
+        if snapshot is not None:
+            for item in sorted(snapshot.entities, key=lambda value: value.entity_id):
+                add_candidate(item)
+
+        snapshot_by_id = (
+            {item.entity_id: item for item in snapshot.entities}
+            if snapshot is not None
+            else {}
+        )
+        fallback_ids = dict.fromkeys(
+            (*self.lights, *self._behavior_configured_lights),
+        )
+        for entity_id in fallback_ids:
+            if entity_id in selected_entity_ids:
+                continue
+            entry = registry.async_get(entity_id)
+            state = self.hass.states.get(entity_id)
+            if entry is None or not self._behavior_state_available(state):
+                continue
+            item = snapshot_by_id.get(entity_id)
+            if item is not None:
+                add_candidate(item, device_id=entry.device_id, fallback=True)
+                continue
+            if entry.domain != LIGHT_DOMAIN:
+                # A switch is only admitted when discovery has explicitly
+                # classified it as a light-like load.
+                continue
+            add_candidate(
+                type(
+                    "_ConfiguredLight",
+                    (),
+                    {
+                        "entity_id": entity_id,
+                        "domain": entry.domain,
+                        "area_id": entry.area_id,
+                        "area_name": None,
+                        "capabilities": ("on_off_light",),
+                        "available": True,
+                        "device_id": entry.device_id,
+                    },
+                )(),
+                device_id=entry.device_id,
+                fallback=True,
+            )
+
+        def candidate_rank(candidate: CandidateRecord) -> tuple[int, int, str]:
+            return (
+                0 if candidate.available else 1,
+                0 if candidate.domain == LIGHT_DOMAIN else 1,
+                candidate.entity_id,
+            )
+
+        # Discovery intentionally supplies safely classified whole-house fixtures,
+        # including unconfigured ones. Runtime readiness, phase, switch state, and
+        # per-entity manual-hold gates decide whether a candidate may be called.
+        device_selected: dict[
+            tuple[str, str],
+            tuple[CandidateRecord, str | None, str | None],
+        ] = {}
+        for candidate, device_id, normalized_name in sorted(
+            eligible.values(),
+            key=lambda value: value[0].entity_id,
+        ):
+            key = (
+                ("device", device_id) if device_id else ("entity", candidate.entity_id)
+            )
+            previous = device_selected.get(key)
+            if previous is None or candidate_rank(candidate) < candidate_rank(
+                previous[0],
+            ):
+                device_selected[key] = (candidate, device_id, normalized_name)
+
+        alias_selected: dict[
+            tuple[str, str, str] | tuple[str, str],
+            tuple[CandidateRecord, str | None, str | None],
+        ] = {}
+        for candidate, device_id, normalized_name in device_selected.values():
+            object_id = candidate.entity_id.split(".", 1)[1]
+            alias_key: tuple[str, str, str] | tuple[str, str]
+            if normalized_name is not None:
+                alias_key = (object_id, normalized_name, candidate.area)
+            else:
+                alias_key = (candidate.domain, candidate.entity_id)
+            previous = alias_selected.get(alias_key)
+            if previous is None or candidate_rank(candidate) < candidate_rank(
+                previous[0],
+            ):
+                alias_selected[alias_key] = (candidate, device_id, normalized_name)
+
+        return tuple(
+            candidate
+            for candidate, _, _ in sorted(
+                alias_selected.values(),
+                key=lambda value: value[0].entity_id,
+            )
+        )
+
+    @staticmethod
+    def _behavior_timestamp(
+        value: datetime.datetime | None,
+    ) -> datetime.datetime | None:
+        """Normalize HA timestamps for the temporal runtime."""
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).astimezone(
+                dt_util.UTC,
+            )
+        return value.astimezone(dt_util.UTC)
+
+    @staticmethod
+    def _behavior_number(value: Any) -> float | None:
+        """Parse one finite numeric sensor value without retaining raw data."""
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _behavior_attributes(state: State | None) -> dict[str, Any]:
+        """Copy only classifier-supported scalar attributes from one HA state."""
+        if state is None:
+            return {}
+        keys = {
+            "alarm_state",
+            "alarm_status",
+            "app_id",
+            "app_name",
+            "arrived",
+            "arrival",
+            "arrival_signal",
+            "cloud_coverage",
+            "cloudiness",
+            "condition",
+            "content_type",
+            "device_class",
+            "elevation",
+            "energy",
+            "energy_power",
+            "friendly_name",
+            "illuminance",
+            "irradiance",
+            "media_content_type",
+            "media_type",
+            "media_title",
+            "pv_power",
+            "security_state",
+            "security_status",
+            "sleep",
+            "sleep_mode",
+            "sleeping",
+            "solar_irradiance",
+            "solar_power",
+            "source_app",
+            "sun_elevation",
+            "temperature",
+            "title",
+            "unit_of_measurement",
+            "weather_state",
+        }
+        return {
+            key: value
+            for key, value in state.attributes.items()
+            if key in keys
+            and (
+                isinstance(value, (str, int, float, bool, datetime.datetime))
+                or value is None
+            )
+        }
+
+    def _behavior_solar_signal(self, state: State) -> tuple[int, float] | None:
+        """Return a ranked instantaneous solar/PV signal, or fail closed."""
+        attributes = self._behavior_attributes(state)
+        entry = entity_registry.async_get(self.hass).async_get(state.entity_id)
+        labels = (
+            state.entity_id,
+            attributes.get("friendly_name"),
+            getattr(entry, "name", None),
+            getattr(entry, "original_name", None),
+            getattr(entry, "original_name_unprefixed", None),
+        )
+        text = " ".join(str(value) for value in labels if value).casefold()
+        for separator in ("_", "-", ".", "/"):
+            text = text.replace(separator, " ")
+        words = set(text.split())
+        device_class = str(
+            attributes.get("device_class") or getattr(entry, "device_class", "") or "",
+        ).casefold()
+        unit = (
+            str(
+                attributes.get("unit_of_measurement")
+                or getattr(entry, "unit_of_measurement", "")
+                or "",
+            )
+            .strip()
+            .casefold()
+        )
+        excluded_words = {
+            "battery",
+            "configuration",
+            "current",
+            "daily",
+            "energy",
+            "lifetime",
+            "setting",
+            "settings",
+            "soc",
+            "temperature",
+            "today",
+            "total",
+            "voltage",
+            "yield",
+        }
+        excluded_device_classes = {
+            "battery",
+            "current",
+            "energy",
+            "temperature",
+            "voltage",
+        }
+        excluded_units = {
+            "%",
+            "a",
+            "ah",
+            "c",
+            "°c",
+            "hz",
+            "ka",
+            "kwh",
+            "ma",
+            "mwh",
+            "v",
+            "va",
+            "var",
+            "wh",
+        }
+        normalized_device_class = device_class.rsplit(".", 1)[-1]
+        if (
+            words.intersection(excluded_words)
+            or normalized_device_class in excluded_device_classes
+            or unit in excluded_units
+            or unit.endswith("wh")
+        ):
+            return None
+
+        attribute_signal = next(
+            (
+                (key, value)
+                for key in (
+                    "pv_power",
+                    "solar_power",
+                    "solar_irradiance",
+                    "irradiance",
+                )
+                if (value := self._behavior_number(attributes.get(key))) is not None
+            ),
+            None,
+        )
+        exact_preferred = state.entity_id == "sensor.solar_inverter_pv_power"
+        irradiance_semantics = "irradiance" in words
+        pv_power_semantics = "power" in words and bool(
+            words.intersection({"photovoltaic", "pv", "solar"}),
+        )
+        if (
+            not exact_preferred
+            and attribute_signal is None
+            and not irradiance_semantics
+            and not pv_power_semantics
+        ):
+            return None
+        value = (
+            attribute_signal[1]
+            if attribute_signal is not None
+            else self._behavior_number(state.state)
+        )
+        if value is None:
+            return None
+        if unit == "kw":
+            value *= 1_000
+        elif unit == "mw":
+            value *= 1_000_000
+        rank = (
+            0
+            if exact_preferred
+            else 1
+            if attribute_signal is not None
+            and attribute_signal[0] in {"pv_power", "solar_power"}
+            else 2
+            if attribute_signal is not None
+            else 3
+            if "pv" in words and "power" in words
+            else 4
+            if pv_power_semantics
+            else 5
+        )
+        return rank, value
+
+    def _behavior_area_context(
+        self,
+        now: datetime.datetime,
+    ) -> dict[str, dict[str, Any]]:
+        """Build bounded room-local context for the runtime's area merge."""
+        snapshot = self._discovery_snapshot
+        if snapshot is None:
+            return {}
+        capability_groups = {
+            "motion": {"motion"},
+            "occupancy": {"occupancy"},
+            "presence": {"presence", "household_presence"},
+            "opening": {"opening", "door", "window", "garage_door"},
+        }
+        area_entities: dict[str, dict[str, list[str]]] = {}
+        for item in snapshot.entities:
+            area = item.area_name or item.area_id
+            if not area:
+                continue
+            for group, capabilities in capability_groups.items():
+                if capabilities.intersection(item.capabilities):
+                    area_entities.setdefault(area, {}).setdefault(group, []).append(
+                        item.entity_id,
+                    )
+
+        def timestamp(state: State | None) -> datetime.datetime | None:
+            return self._behavior_timestamp(state.last_changed) if state else None
+
+        def latest(states: list[State]) -> State | None:
+            return max(
+                states,
+                key=lambda state: timestamp(state)
+                or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+                default=None,
+            )
+
+        contexts: dict[str, dict[str, Any]] = {}
+        for area in sorted(area_entities)[:128]:
+            states_by_group = {
+                group: [
+                    state
+                    for entity_id in entity_ids
+                    if self._behavior_state_available(
+                        state := self.hass.states.get(entity_id),
+                    )
+                ]
+                for group, entity_ids in area_entities[area].items()
+            }
+            occupancy_states = states_by_group.get("occupancy", [])
+            presence_states = states_by_group.get("presence", [])
+            presence = (
+                "unknown"
+                if not presence_states
+                else "present"
+                if any(_state_is_active(state) for state in presence_states)
+                else "absent"
+            )
+            occupancy = (
+                "unknown"
+                if not (occupancy_states or presence_states)
+                else "occupied"
+                if any(
+                    _state_is_active(state)
+                    for state in (*occupancy_states, *presence_states)
+                )
+                else "empty"
+            )
+            event_times: dict[str, datetime.datetime] = {}
+            state_dwell: dict[str, float] = {}
+            current_states: dict[str, str] = {}
+            for group in ("motion", "occupancy", "presence", "opening"):
+                state = latest(states_by_group.get(group, []))
+                changed = timestamp(state)
+                if changed is None:
+                    continue
+                event_times[group] = changed
+                state_dwell[group] = max(0.0, (now - changed).total_seconds())
+                current_states[group] = state.state
+            contexts[area] = {
+                "occupancy": occupancy,
+                "presence": presence,
+                "event_times": event_times,
+                "state_dwell": state_dwell,
+                "categorical_context": {
+                    "occupancy": occupancy,
+                    "presence": presence,
+                    "motion": current_states.get("motion", "unknown"),
+                    "opening": current_states.get("opening", "unknown"),
+                },
+            }
+        return contexts
+
+    def _behavior_context(self) -> Mapping[str, Any]:  # noqa: PLR0912, PLR0915
+        """Return the bounded current context consumed by temporal behavior ML."""
+        now = dt_util.utcnow()
+        if now.tzinfo is None or now.utcoffset() is None:
+            now = now.replace(tzinfo=dt_util.UTC)
+        else:
+            now = now.astimezone(dt_util.UTC)
+
+        groups = {
+            "occupancy": self._intelligence_entity_ids(CONF_OCCUPANCY_ENTITIES),
+            "presence": self._intelligence_entity_ids(CONF_PRESENCE_ENTITIES),
+            "arrival": self._intelligence_entity_ids("arrivals"),
+            "opening": self._intelligence_entity_ids("openings"),
+            "media": self._intelligence_entity_ids(CONF_MEDIA_ENTITIES),
+            "security": self._intelligence_entity_ids("security"),
+            "weather": self._intelligence_entity_ids("weather"),
+            "daylight": self._intelligence_entity_ids("daylight"),
+            "solar": self._intelligence_entity_ids("solar"),
+            "holiday": self._intelligence_entity_ids("holidays"),
+            "illuminance": self._intelligence_entity_ids(CONF_ILLUMINANCE_ENTITIES),
+            "presence_household": self._intelligence_entity_ids(
+                CONF_PRESENCE_ENTITIES,
+            ),
+            "household_presence": list(
+                self._discovered_context_entities.get("household_presence", []),
+            ),
+        }
+        configured_home = self._intelligence_entities.get(CONF_HOME_STATE_ENTITY)
+        if configured_home:
+            groups["home"] = [configured_home]
+        configured_people = [
+            entity_id
+            for entity_id in self._intelligence_entities.get(
+                CONF_PRESENCE_ENTITIES,
+                [],
+            )
+            if entity_id.split(".", 1)[0] == "person"
+        ]
+        groups["household_presence"] = list(
+            dict.fromkeys((*groups["household_presence"], *configured_people)),
+        )
+        single_ids = {
+            "security": self._intelligence_single_entity(
+                CONF_SECURITY_STATE_ENTITY,
+                "security",
+            ),
+            "sleep": self._intelligence_single_entity(CONF_SLEEP_ENTITY, "sleep"),
+            "energy": self._intelligence_single_entity(
+                CONF_ENERGY_CONSTRAINT_ENTITY,
+                "weather",
+            ),
+            "manual_hold": self._intelligence_single_entity(
+                CONF_MANUAL_HOLD_ENTITY,
+                "manual_hold",
+            ),
+            "semantic": self._intelligence_single_entity(
+                CONF_SEMANTIC_INTENT_ENTITY,
+                "semantic_intent",
+            ),
+        }
+        for name, entity_id in single_ids.items():
+            if entity_id:
+                groups[name] = [entity_id]
+
+        state_by_id = {
+            entity_id: self.hass.states.get(entity_id)
+            for entity_ids in groups.values()
+            for entity_id in entity_ids
+            if entity_id
+        }
+
+        def live_states(name: str) -> list[State]:
+            return [
+                state
+                for entity_id in groups.get(name, [])
+                if self._behavior_state_available(state := state_by_id.get(entity_id))
+            ]
+
+        def latest(name: str) -> State | None:
+            return max(
+                live_states(name),
+                key=lambda state: self._behavior_timestamp(state.last_changed)
+                or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+                default=None,
+            )
+
+        def age_seconds(state: State | None) -> float | None:
+            changed = self._behavior_timestamp(state.last_changed) if state else None
+            if changed is None:
+                return None
+            return max(0.0, (now - changed).total_seconds())
+
+        occupancy_states = live_states("occupancy")
+        presence_states = live_states("presence")
+        home_state = latest("home")
+        home_classification = classify_household_state(
+            {
+                "state": home_state.state if home_state else None,
+                "attributes": self._behavior_attributes(home_state),
+                "entity_id": home_state.entity_id if home_state else None,
+            },
+        )
+        presence_value = (
+            "unknown"
+            if not presence_states
+            else "present"
+            if any(_state_is_active(state) for state in presence_states)
+            else "absent"
+        )
+        occupancy_value = (
+            "unknown"
+            if not (occupancy_states or presence_states)
+            else "occupied"
+            if any(
+                _state_is_active(state)
+                for state in (*occupancy_states, *presence_states)
+            )
+            else "empty"
+        )
+        home_away = home_classification.category.value
+        if home_away == "unknown":
+            household_classifications = [
+                classify_household_state(
+                    {
+                        "state": state.state,
+                        "attributes": self._behavior_attributes(state),
+                        "entity_id": state.entity_id,
+                    },
+                ).category.value
+                for state in live_states("household_presence")
+            ]
+            if "home" in household_classifications:
+                home_away = "home"
+            elif household_classifications and all(
+                value == "away" for value in household_classifications
+            ):
+                home_away = "away"
+
+        arrival_state = latest("arrival")
+        arrival_age = age_seconds(arrival_state)
+        arrival_classification = classify_arrival_state(
+            {
+                "state": arrival_state.state if arrival_state else None,
+                "attributes": self._behavior_attributes(arrival_state),
+                "entity_id": arrival_state.entity_id if arrival_state else None,
+            },
+            observed_at=(
+                self._behavior_timestamp(arrival_state.last_changed)
+                if arrival_state
+                else None
+            ),
+            age_seconds=arrival_age,
+            max_age_seconds=15 * 60,
+            now=now,
+        )
+        recent_arrival = arrival_classification.category is ArrivalState.RECENT
+
+        media_states = live_states("media")
+        active_media = [
+            state
+            for state in media_states
+            if state.state.lower() in {"playing", "paused", "buffering", "on"}
+        ]
+        media_state = max(
+            active_media,
+            key=lambda state: self._behavior_timestamp(state.last_changed)
+            or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+            default=None,
+        ) or latest("media")
+        media_attributes = self._behavior_attributes(media_state)
+        media_classification = classify_media_state(
+            {
+                "state": media_state.state if media_state else None,
+                "attributes": media_attributes,
+                "entity_id": media_state.entity_id if media_state else None,
+            },
+        )
+        media_category = media_classification.category.value
+
+        security_state = latest("security")
+        security_attributes = self._behavior_attributes(security_state)
+        security_classification = classify_security_state(
+            {
+                "state": security_state.state if security_state else None,
+                "attributes": security_attributes,
+                "entity_id": security_state.entity_id if security_state else None,
+            },
+        )
+        security_category = security_classification.category.value
+        emergency = security_classification.category is SecurityState.EMERGENCY
+        safety = emergency or security_category == "problem"
+
+        daylight_states = [*live_states("daylight"), *live_states("illuminance")]
+        solar_states = live_states("solar")
+        weather_state = latest("weather")
+        daylight_state = max(
+            daylight_states,
+            key=lambda state: self._behavior_timestamp(state.last_changed)
+            or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+            default=None,
+        )
+        weather_attributes = self._behavior_attributes(weather_state)
+        weather_classification = classify_weather_daylight(
+            {
+                "state": weather_state.state if weather_state else None,
+                "attributes": weather_attributes,
+                "entity_id": weather_state.entity_id if weather_state else None,
+            },
+        )
+        weather_category = weather_classification.category.value
+        weather_condition = (
+            weather_attributes.get("condition")
+            or weather_attributes.get("weather_state")
+            or (weather_state.state if weather_state else None)
+        )
+
+        daylight_attributes = self._behavior_attributes(daylight_state)
+        daylight_classification = classify_weather_daylight(
+            {
+                "state": daylight_state.state if daylight_state else None,
+                "attributes": daylight_attributes,
+                "entity_id": daylight_state.entity_id if daylight_state else None,
+            },
+        )
+        illuminance_state = next(
+            (
+                state
+                for state in live_states("illuminance")
+                if self._behavior_number(state.state) is not None
+            ),
+            None,
+        )
+        illuminance = self._behavior_number(
+            illuminance_state.state if illuminance_state else None,
+        )
+        energy_state = latest("energy")
+        energy_value = self._behavior_number(
+            energy_state.state if energy_state else None,
+        )
+        ranked_solar: list[tuple[int, float, float]] = []
+        for state in solar_states:
+            signal = self._behavior_solar_signal(state)
+            if signal is None:
+                continue
+            rank, value = signal
+            changed = (
+                self._behavior_timestamp(state.last_changed)
+                or datetime.datetime.min.replace(tzinfo=dt_util.UTC)
+            ).timestamp()
+            ranked_solar.append((rank, -changed, value))
+        solar_value = min(ranked_solar)[2] if ranked_solar else None
+        daylight_band = daylight_classification.category.value
+        if illuminance is not None:
+            daylight_band = (
+                "dark" if illuminance < 30 else "dim" if illuminance < 150 else "bright"
+            )
+        solar_band = (
+            "unknown"
+            if solar_value is None
+            else "none"
+            if solar_value <= 0
+            else "low"
+            if solar_value < 120
+            else "high"
+        )
+        energy_band = (
+            "unknown"
+            if energy_value is None
+            else "low"
+            if energy_value <= 0
+            else "high"
+        )
+
+        semantic_state = latest("semantic")
+        semantic_value = semantic_state.state if semantic_state else ""
+        if not isinstance(semantic_value, str):
+            semantic_value = ""
+        semantic_value = (
+            semantic_value.strip().lower().replace("-", "_").replace(" ", "_")
+        )
+        sleep_state = latest("sleep")
+        sleep = _state_is_active(sleep_state) or any(
+            token in semantic_value for token in ("sleep", "sleeping", "good_night")
+        )
+        good_night = (
+            sleep or "good_night" in semantic_value or semantic_value == "goodnight"
+        )
+        semantic_routine = "good_night" if good_night else semantic_value or "ambient"
+        manual_hold_state = latest("manual_hold")
+        manual_hold = _state_is_active(manual_hold_state)
+
+        holiday_state = latest("holiday")
+        holiday = _state_is_active(holiday_state)
+        holiday_provenance = None
+        if holiday_state is not None:
+            holiday_provenance = (
+                self._behavior_attributes(holiday_state).get("friendly_name")
+                or holiday_state.entity_id
+            )
+        local_now = dt_util.as_local(now)
+        day_type = "weekend" if local_now.weekday() >= 5 else "weekday"
+
+        event_times: dict[str, datetime.datetime] = {}
+        state_dwell: dict[str, float] = {}
+        event_groups = {
+            "occupancy": "occupancy",
+            "presence": "presence",
+            "arrival": "arrival",
+            "opening": "opening",
+            "media": "media",
+            "security": "security",
+            "home": "home",
+        }
+        for event_name, group_name in event_groups.items():
+            state = latest(group_name)
+            changed = self._behavior_timestamp(state.last_changed) if state else None
+            if changed is not None:
+                event_times[event_name] = changed
+                state_dwell[event_name] = max(0.0, (now - changed).total_seconds())
+
+        categorical_context = {
+            "occupancy": occupancy_value,
+            "presence": presence_value,
+            "home_away": home_away,
+            "arrival": "recent" if recent_arrival else "inactive",
+            "media": media_category,
+            "security": security_category,
+            "weather": weather_category,
+            "daylight": daylight_band,
+            "solar": solar_band,
+            "energy": energy_band,
+            "routine": semantic_routine,
+            "mode": "sleep" if sleep else home_away,
+            "day_type": day_type,
+            "manual_hold": "held" if manual_hold else "free",
+        }
+        sun_elevation = daylight_attributes.get("sun_elevation")
+        if sun_elevation is None:
+            sun_elevation = daylight_attributes.get("elevation")
+        return {
+            "timestamp": now,
+            "occupancy": occupancy_value,
+            "occupancy_available": bool(occupancy_states or presence_states),
+            "presence": presence_value,
+            "presence_available": bool(presence_states),
+            "home_away": home_away,
+            "home_state": home_away,
+            "recent_arrival": recent_arrival,
+            "arrival_timestamp": (
+                self._behavior_timestamp(arrival_state.last_changed)
+                if arrival_state and arrival_state.last_changed
+                else None
+            ),
+            "semantic_routine": semantic_routine,
+            "good_night": good_night,
+            "sleep": sleep,
+            "media": media_category,
+            "media_category": media_category,
+            "media_state": media_state.state if media_state else "unknown",
+            "app_name": media_attributes.get("app_name"),
+            "source_app": media_attributes.get("source_app")
+            or media_attributes.get("app_id"),
+            "media_content_type": media_attributes.get("media_content_type")
+            or media_attributes.get("media_type")
+            or media_attributes.get("content_type"),
+            "alarm": security_category,
+            "alarm_state": security_state.state if security_state else None,
+            "security": security_category,
+            "safety": safety,
+            "emergency": emergency,
+            "weather": weather_category,
+            "weather_condition": weather_condition,
+            "daylight": daylight_band,
+            "daylight_band": daylight_band,
+            "sun": sun_elevation,
+            "illuminance": illuminance,
+            "solar": solar_value,
+            "solar_band": solar_band,
+            "energy": energy_value,
+            "energy_band": energy_band,
+            "is_holiday": holiday,
+            "holiday": holiday,
+            "holiday_name": holiday_provenance,
+            "holiday_provenance": holiday_provenance,
+            "is_weekend": day_type == "weekend",
+            "day_type": day_type,
+            "manual_hold": manual_hold,
+            "categorical_context": categorical_context,
+            "event_times": event_times,
+            "state_dwell": state_dwell,
+            "area_context": self._behavior_area_context(now),
+        }
+
+    def _behavior_phase(self) -> str:
+        """Return the training phase exposed to the temporal runtime."""
+        return self._training.phase if self._training is not None else "disabled"
+
+    def _behavior_actuation_enabled(self) -> bool:
+        """Gate behavior service calls behind the complete rollout contract."""
+        return bool(
+            self.is_on
+            and self._behavior_runtime_started
+            and self._training is not None
+            and self._training.is_active
+            and self._intelligence_training_config["auto_promote"]
+            and not self._intelligence_shadow_actuation_blocked,
+        )
+
+    async def _async_behavior_changed(self, _: Mapping[str, Any]) -> None:
+        """Publish bounded runtime diagnostics without breaking HA callbacks."""
+        if (
+            self.hass.is_running
+            and self.entity_id
+            and self.hass.states.get(self.entity_id)
+        ):
+            self.async_write_ha_state()
+
+    async def _async_behavior_observation_accepted(self, observation: Any) -> None:
+        """Count accepted on/off and Good Night behavior toward commissioning."""
+        if self._training is not None:
+            await self._training.async_record_behavior_observation(observation)
+
+    def _schedule_behavior_evaluation(self) -> None:
+        """Coalesce discovery/context changes into one runtime evaluation."""
+        if self._behavior_runtime is None or not self._behavior_runtime_started:
+            return
+        if (
+            self._behavior_evaluate_task is not None
+            and not self._behavior_evaluate_task.done()
+        ):
+            return
+        self._behavior_evaluate_task = self.hass.async_create_task(
+            self._async_evaluate_behavior(),
+            name=f"adaptive_lighting_behavior_{slugify(self._name)}",
+        )
+
+    async def _async_evaluate_behavior(self) -> None:
+        """Run one behavior evaluation and always clear its tracked task."""
+        task = asyncio.current_task()
+        try:
+            if self._behavior_runtime is not None:
+                await self._behavior_runtime.async_evaluate()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Adaptive Lighting behavior evaluation failed")
+        finally:
+            if self._behavior_evaluate_task is task:
+                self._behavior_evaluate_task = None
+
+    def _cancel_behavior_evaluation(self) -> asyncio.Task[None] | None:
+        """Synchronously block and cancel the one coalesced behavior task."""
+        task = self._behavior_evaluate_task
+        self._behavior_evaluate_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        return task
+
+    async def _async_await_behavior_cancellation(
+        self,
+        task: asyncio.Task[None] | None,
+    ) -> None:
+        """Await behavior cancellation so teardown cannot race actuation."""
+        if task is None or task is asyncio.current_task():
+            return
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _async_start_behavior_runtime(self) -> None:
+        """Start one behavior runtime only while this switch is enabled."""
+        if self._behavior_runtime is None or self._behavior_runtime_started:
+            return
+        await self._behavior_runtime.async_start()
+        self._behavior_runtime_started = True
+
+    async def _async_stop_behavior_runtime(
+        self,
+        task: asyncio.Task[None] | None = None,
+    ) -> None:
+        """Await any evaluation before stopping all runtime listeners."""
+        self._behavior_runtime_started = False
+        task = task or self._cancel_behavior_evaluation()
+        await self._async_await_behavior_cancellation(task)
+        if self._behavior_runtime is not None:
+            await self._behavior_runtime.async_stop()
+
+    async def _async_abort_intelligence_cleanup(
+        self,
+        task: asyncio.Task[None] | None,
+    ) -> None:
+        """Finish cleanup when HA aborts entity platform addition."""
+        await self._async_stop_behavior_runtime(task)
+        if self._discovery is not None:
+            await self._discovery.async_stop()
+        if self._training is not None:
+            await self._training.async_unload()
+
+    def _clear_behavior_abort_cleanup(self, task: asyncio.Task[None]) -> None:
+        """Clear only the abort task whose completion callback is running."""
+        if self._behavior_abort_cleanup_task is task:
+            self._behavior_abort_cleanup_task = None
 
     def _is_public_holiday(self, _: datetime.date) -> bool:
         """Resolve today's holiday from configured/auto-discovered local entities."""
@@ -1465,6 +2492,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         _: EventStateChangedData,
     ) -> None:
         """Coalesce noisy sensor bursts while keeping alarms responsive."""
+        self._schedule_behavior_evaluation()
         if not self.is_on or (
             self._intelligence_context_refresh_task is not None
             and not self._intelligence_context_refresh_task.done()
@@ -1506,11 +2534,19 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             await self.async_turn_on(adapt_lights=not self._only_once)
         else:
             self._state = False
+            await self._async_stop_behavior_runtime()
             assert not self.remove_listeners
 
     async def async_will_remove_from_hass(self) -> None:
         """Remove the listeners upon removing the component."""
+        self._intelligence_teardown_started = True
+        self._behavior_runtime_started = False
+        behavior_task = self._cancel_behavior_evaluation()
         self._remove_listeners()
+        if self._behavior_abort_cleanup_task is not None:
+            await self._behavior_abort_cleanup_task
+            return
+        await self._async_stop_behavior_runtime(behavior_task)
         if self._discovery is not None:
             await self._discovery.async_stop()
         if self._training is not None:
@@ -1579,7 +2615,22 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         # For some unknown reason (to me) `async_will_remove_from_hass`
         # is not called in `add_to_platform_abort`.
         # See https://github.com/basnijholt/adaptive-lighting/issues/658
+        self._behavior_runtime_started = False
+        behavior_task = self._cancel_behavior_evaluation()
         self._remove_listeners()
+        if (
+            not self._intelligence_teardown_started
+            and self._behavior_abort_cleanup_task is None
+        ):
+            self._intelligence_teardown_started = True
+            cleanup_task = self.hass.async_create_task(
+                self._async_abort_intelligence_cleanup(behavior_task),
+                name=f"adaptive_lighting_abort_cleanup_{slugify(self._name)}",
+            )
+            self._behavior_abort_cleanup_task = cleanup_task
+            cleanup_task.add_done_callback(self._clear_behavior_abort_cleanup)
+            if cleanup_task.done():
+                self._clear_behavior_abort_cleanup(cleanup_task)
         try:
             # HACK: this is a private method in `Entity` which can change
             super()._call_on_remove_callbacks()
@@ -1603,7 +2654,6 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         ):
             self._intelligence_context_refresh_task.cancel()
         self._intelligence_context_refresh_task = None
-
         while self.remove_listeners:
             remove_listener = self.remove_listeners.pop()
             remove_listener()
@@ -2047,6 +3097,21 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the attributes of the switch."""
         extra_state_attributes: dict[str, Any] = {"configuration": self._config}
+        if self._behavior_runtime is not None:
+            behavior = self._behavior_runtime.diagnostics
+            decisions = behavior.get("last_decisions", [])
+            behavior["shadow_ready"] = sum(
+                bool(item.get("ready"))
+                for item in decisions
+                if isinstance(item, Mapping)
+            )
+            behavior["shadow_executed"] = sum(
+                bool(item.get("executed"))
+                for item in decisions
+                if isinstance(item, Mapping)
+            )
+            behavior["actuation_enabled"] = self._behavior_actuation_enabled()
+            extra_state_attributes["intelligence_behavior"] = behavior
         if not self.is_on:
             for key in self._settings:
                 extra_state_attributes[key] = None
@@ -2084,9 +3149,14 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                         }
                         for item in snapshot.entities[:100]
                     ],
-                    "added": [item.entity_id for item in snapshot.added],
-                    "removed": [item.entity_id for item in snapshot.removed],
-                    "moved": [item.to_dict() for item in snapshot.moved],
+                    "added": [item.entity_id for item in snapshot.added[:100]],
+                    "removed": [item.entity_id for item in snapshot.removed[:100]],
+                    "moved": [item.to_dict() for item in snapshot.moved[:100]],
+                    "renamed": [item.to_dict() for item in snapshot.renamed[:100]],
+                    "added_truncated": len(snapshot.added) > 100,
+                    "removed_truncated": len(snapshot.removed) > 100,
+                    "moved_truncated": len(snapshot.moved) > 100,
+                    "renamed_truncated": len(snapshot.renamed) > 100,
                     "truncated": len(snapshot.entities) > 100,
                 }
         timers = self.manager.auto_reset_manual_control_timers
@@ -2117,9 +3187,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             self._name,
             self._state,
         )
-        if self.is_on:
+        if self.is_on and (
+            self._behavior_runtime is None or self._behavior_runtime_started
+        ):
             return
         self._state = True
+        await self._async_start_behavior_runtime()
+        self._schedule_behavior_evaluation()
         self.manager.reset(*self.lights)
         await self._setup_listeners()
         if adapt_lights:
@@ -2131,10 +3205,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:  # noqa: ARG002
         """Turn off adaptive lighting."""
-        if not self.is_on:
+        if not self.is_on and not self._behavior_runtime_started:
             return
         self._state = False
+        self._behavior_runtime_started = False
+        behavior_task = self._cancel_behavior_evaluation()
         self._remove_listeners()
+        await self._async_stop_behavior_runtime(behavior_task)
         self.manager.reset(*self.lights)
 
     async def _async_update_at_interval_action(

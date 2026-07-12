@@ -120,6 +120,7 @@ from homeassistant.const import (
     ATTR_DOMAIN,
     ATTR_ENTITY_ID,
     ATTR_SERVICE,
+    ATTR_SERVICE_DATA,
     ATTR_SUPPORTED_FEATURES,
     CONF_LIGHTS,
     CONF_NAME,
@@ -1828,11 +1829,13 @@ async def test_intelligence_training_forces_shadow_then_auto_promotes(hass):
         Context(user_id="00000000000000000000000000000001"),
     )
     await hass.async_block_till_done()
+    # A brightness correction is not a power-state transition.
     assert switch._training.sample_count == 1, (
         switch._training.last_rejection_reason,
         switch._training.sample_counts,
         hass.states.get(ENTITY_LIGHT_1),
     )
+    assert switch._training.summary()["sample_counts"]["behavior_accepted"] == 0
 
     promoted = await switch._training.async_evaluate_promotion(
         now=switch._training.deadline,
@@ -1842,12 +1845,912 @@ async def test_intelligence_training_forces_shadow_then_auto_promotes(hass):
     assert switch.extra_state_attributes["intelligence_training"]["phase"] == "active"
 
 
+def _register_state_entity(
+    hass,
+    entity_registry,
+    domain: str,
+    unique_id: str,
+    state: str,
+    attributes: dict[str, Any] | None = None,
+) -> str:
+    """Register and publish a small HA-shaped context entity for a test."""
+    entry = entity_registry.async_get_or_create(
+        domain,
+        "adaptive_lighting_test",
+        unique_id,
+    )
+    hass.states.async_set(entry.entity_id, state, attributes or {})
+    return entry.entity_id
+
+
+async def test_behavior_lifecycle_starts_after_training_and_stops_cleanly(hass):
+    """Training-enabled intelligence owns one started runtime until removal."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+
+    assert switch._behavior_runtime is not None
+    assert switch._behavior_runtime._loaded is True
+    assert switch._behavior_runtime_started is True
+    behavior = switch.extra_state_attributes["intelligence_behavior"]
+    assert "shadow_ready" in behavior
+    assert "shadow_executed" in behavior
+
+    await switch.async_turn_off()
+
+    assert switch._behavior_runtime._stopped is True
+    assert switch._behavior_runtime_started is False
+    assert switch._behavior_evaluate_task is None
+
+    await switch.async_turn_on()
+
+    assert switch._behavior_runtime._loaded is True
+    assert switch._behavior_runtime_started is True
+
+    await switch.async_will_remove_from_hass()
+
+    assert switch._behavior_runtime._stopped is True
+    assert switch._behavior_runtime_started is False
+
+
+@pytest.mark.parametrize("teardown", ["turn_off", "removal"])
+async def test_behavior_teardown_awaits_in_flight_evaluation_without_calls(
+    hass,
+    teardown,
+):
+    """Disabling/removal closes the actuation gate before awaiting cancellation."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    finish_cancellation = asyncio.Event()
+    service_events = []
+
+    async def delayed_evaluation():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await finish_cancellation.wait()
+            if switch._behavior_actuation_enabled():
+                await hass.services.async_call(
+                    LIGHT_DOMAIN,
+                    SERVICE_TURN_ON,
+                    {ATTR_ENTITY_ID: ENTITY_LIGHT_1},
+                    blocking=True,
+                )
+            raise
+
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_events.append)
+    try:
+        with patch.object(
+            switch._behavior_runtime,
+            "async_evaluate",
+            side_effect=delayed_evaluation,
+        ):
+            switch._schedule_behavior_evaluation()
+            await entered.wait()
+            cleanup = asyncio.create_task(
+                switch.async_turn_off()
+                if teardown == "turn_off"
+                else switch.async_will_remove_from_hass(),
+            )
+            await cancelled.wait()
+            assert switch._behavior_runtime_started is False
+            assert switch._behavior_actuation_enabled() is False
+            assert cleanup.done() is False
+            finish_cancellation.set()
+            await cleanup
+    finally:
+        remove_listener()
+
+    assert switch._behavior_evaluate_task is None
+    assert switch._behavior_runtime._stopped is True
+    assert not [
+        event
+        for event in service_events
+        if event.data.get(ATTR_DOMAIN) in {LIGHT_DOMAIN, SWITCH_DOMAIN}
+        and event.data.get(ATTR_SERVICE) in {SERVICE_TURN_ON, SERVICE_TURN_OFF}
+    ]
+
+
+async def test_behavior_abort_callback_cleans_all_intelligence_lifecycles(hass):
+    """Platform-add abort schedules complete runtime/discovery/training cleanup."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+
+    switch._call_on_remove_callbacks()
+    await hass.async_block_till_done()
+
+    assert switch._behavior_runtime_started is False
+    assert switch._behavior_runtime._stopped is True
+    assert switch._discovery.started is False
+    assert switch._training._unloaded is True
+    assert switch._behavior_abort_cleanup_task is None
+
+
+async def test_behavior_context_sleep_entity_is_good_night(hass, entity_registry):
+    """An active configured sleep entity must suppress Good Night proposals."""
+    sleep_entity = _register_state_entity(
+        hass,
+        entity_registry,
+        "input_boolean",
+        "good_night_active",
+        STATE_ON,
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_SLEEP_ENTITY: sleep_entity,
+        },
+    )
+
+    context = switch._behavior_context()
+
+    assert context["sleep"] is True
+    assert context["good_night"] is True
+    assert context["semantic_routine"] == "good_night"
+
+
+async def test_behavior_context_missing_occupancy_and_presence_is_unknown(hass):
+    """Missing context sensors cannot be learned as a false empty household."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+
+    context = switch._behavior_context()
+
+    assert context["occupancy"] == "unknown"
+    assert context["presence"] == "unknown"
+    assert context["occupancy_available"] is False
+    assert context["presence_available"] is False
+    assert context["categorical_context"]["occupancy"] == "unknown"
+    assert context["categorical_context"]["presence"] == "unknown"
+
+
+async def test_behavior_context_room_occupancy_does_not_infer_household_away(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Inactive room sensors cannot synthesize a global household-away state."""
+    for area_name in ("Living", "Office"):
+        area = area_registry.async_create(area_name)
+        occupancy = entity_registry.async_get_or_create(
+            "binary_sensor",
+            "adaptive_lighting_test",
+            f"{area_name.casefold()}_occupancy",
+        )
+        occupancy = entity_registry.async_update_entity(
+            occupancy.entity_id,
+            area_id=area.id,
+            device_class="occupancy",
+        )
+        hass.states.async_set(
+            occupancy.entity_id,
+            STATE_OFF,
+            {"device_class": "occupancy"},
+        )
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    context = switch._behavior_context()
+
+    assert context["occupancy"] == "empty"
+    assert context["home_away"] == "unknown"
+    assert context["area_context"]["Living"]["occupancy"] == "empty"
+    assert context["area_context"]["Office"]["occupancy"] == "empty"
+
+
+async def test_behavior_context_preserves_alarm_status_emergency(
+    hass,
+    entity_registry,
+):
+    """Classifier-supported alarm attributes survive compact context filtering."""
+    security = _register_state_entity(
+        hass,
+        entity_registry,
+        "alarm_control_panel",
+        "home_alarm",
+        "disarmed",
+        {"alarm_status": "triggered"},
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_SECURITY_STATE_ENTITY: security,
+        },
+    )
+    context = switch._behavior_context()
+
+    assert context["security"] == "emergency"
+    assert context["emergency"] is True
+    assert context["safety"] is True
+
+
+async def test_behavior_context_separates_area_activity(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Room-local activity is bounded and differs between discovered areas."""
+    living = area_registry.async_create("Living")
+    office = area_registry.async_create("Office")
+
+    def register_area_sensor(
+        unique_id: str,
+        area_id: str,
+        device_class: str,
+        state: str,
+    ) -> None:
+        entry = entity_registry.async_get_or_create(
+            "binary_sensor",
+            "adaptive_lighting_test",
+            unique_id,
+        )
+        entity_registry.async_update_entity(
+            entry.entity_id,
+            area_id=area_id,
+            device_class=device_class,
+        )
+        hass.states.async_set(
+            entry.entity_id,
+            state,
+            {"device_class": device_class, "unbounded": {"not": "included"}},
+        )
+
+    register_area_sensor("living_motion", living.id, "motion", STATE_ON)
+    register_area_sensor("living_occupancy", living.id, "occupancy", STATE_ON)
+    register_area_sensor("office_motion", office.id, "motion", STATE_OFF)
+    register_area_sensor("office_occupancy", office.id, "occupancy", STATE_OFF)
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    area_context = switch._behavior_context()["area_context"]
+
+    assert set(area_context) == {"Living", "Office"}
+    assert area_context["Living"]["occupancy"] == "occupied"
+    assert area_context["Office"]["occupancy"] == "empty"
+    assert area_context["Living"]["presence"] == "unknown"
+    assert "motion" in area_context["Living"]["event_times"]
+    assert "occupancy" in area_context["Office"]["state_dwell"]
+    assert all("unbounded" not in value for value in area_context["Living"].values())
+
+
+async def test_behavior_context_separates_weather_daylight_and_solar(
+    hass,
+    entity_registry,
+):
+    """A newer PV update must not replace the independent weather signal."""
+    _register_state_entity(
+        hass,
+        entity_registry,
+        "weather",
+        "forecast_home",
+        "rainy",
+        {"condition": "rainy"},
+    )
+    _register_state_entity(
+        hass,
+        entity_registry,
+        "sun",
+        "sun",
+        "above_horizon",
+        {"elevation": 25},
+    )
+    solar_entity = _register_state_entity(
+        hass,
+        entity_registry,
+        "sensor",
+        "pv_power",
+        "800",
+        {"unit_of_measurement": "W"},
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+
+    initial = switch._behavior_context()
+    hass.states.async_set(solar_entity, "1200", {"unit_of_measurement": "W"})
+    await hass.async_block_till_done()
+    updated = switch._behavior_context()
+
+    assert initial["weather"] == "rain"
+    assert updated["weather"] == "rain"
+    assert updated["weather_condition"] == "rainy"
+    assert updated["solar"] == 1200.0
+    assert updated["solar_band"] == "high"
+    assert updated["daylight"] == "bright"
+
+
+async def test_behavior_context_prefers_instantaneous_pv_over_newer_total_energy(
+    hass,
+    entity_registry,
+):
+    """A newer cumulative inverter sensor cannot replace instantaneous PV power."""
+    pv_power = entity_registry.async_get_or_create(
+        "sensor",
+        "adaptive_lighting_test",
+        "preferred_pv_power",
+        suggested_object_id="solar_inverter_pv_power",
+    )
+    total_energy = entity_registry.async_get_or_create(
+        "sensor",
+        "adaptive_lighting_test",
+        "newer_total_energy",
+        suggested_object_id="solar_inverter_total_energy",
+    )
+    sun = entity_registry.async_get_or_create(
+        "sun",
+        "adaptive_lighting_test",
+        "sun_zero_elevation",
+        suggested_object_id="sun",
+    )
+    assert pv_power.entity_id == "sensor.solar_inverter_pv_power"
+    hass.states.async_set(
+        pv_power.entity_id,
+        "650",
+        {
+            "device_class": "power",
+            "friendly_name": "Solar Inverter PV Power",
+            "unit_of_measurement": "W",
+        },
+    )
+    hass.states.async_set(
+        total_energy.entity_id,
+        "99999",
+        {
+            "device_class": "energy",
+            "friendly_name": "Solar Inverter Total Energy",
+            "unit_of_measurement": "kWh",
+        },
+    )
+    hass.states.async_set(sun.entity_id, "above_horizon", {"elevation": 0})
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    context = switch._behavior_context()
+
+    assert context["solar"] == 650.0
+    assert context["solar_band"] == "high"
+    assert context["sun"] == 0
+
+
+async def test_behavior_candidates_deduplicate_native_and_switch_aliases(
+    hass,
+    area_registry,
+    device_registry,
+    entity_registry,
+):
+    """One physical device contributes one native-light candidate."""
+    garage = area_registry.async_create("Garage")
+    device_config_entry = MockConfigEntry(domain="adaptive_lighting_test")
+    device_config_entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=device_config_entry.entry_id,
+        identifiers={("adaptive_lighting_test", "garage_light")},
+    )
+    native = entity_registry.async_get_or_create(
+        LIGHT_DOMAIN,
+        "adaptive_lighting_test",
+        "garage_light",
+        device_id=device.id,
+    )
+    native = entity_registry.async_update_entity(native.entity_id, area_id=garage.id)
+    switch_alias = entity_registry.async_get_or_create(
+        SWITCH_DOMAIN,
+        "adaptive_lighting_test",
+        "garage_light",
+        device_id=device.id,
+    )
+    switch_alias = entity_registry.async_update_entity(
+        switch_alias.entity_id,
+        area_id=garage.id,
+    )
+    standalone_switches = []
+    for unique_id in ("dining_room_light", "office_lamp"):
+        standalone = entity_registry.async_get_or_create(
+            SWITCH_DOMAIN,
+            "adaptive_lighting_test",
+            unique_id,
+        )
+        standalone = entity_registry.async_update_entity(
+            standalone.entity_id,
+            area_id=garage.id,
+        )
+        standalone_switches.append(standalone.entity_id)
+    cover = entity_registry.async_get_or_create(
+        "cover",
+        "adaptive_lighting_test",
+        "garage_door",
+    )
+    cover = entity_registry.async_update_entity(cover.entity_id, area_id=garage.id)
+    for entity_id in (
+        native.entity_id,
+        switch_alias.entity_id,
+        *standalone_switches,
+        cover.entity_id,
+    ):
+        hass.states.async_set(entity_id, STATE_OFF)
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    candidates = {
+        candidate.entity_id: candidate for candidate in switch._behavior_candidates()
+    }
+
+    assert native.entity_id in candidates
+    assert switch_alias.entity_id not in candidates
+    assert set(standalone_switches).issubset(candidates)
+    assert candidates[standalone_switches[0]].explicit_light_switch is True
+    assert candidates[standalone_switches[0]].supports_brightness is False
+    assert cover.entity_id not in candidates
+
+
+async def test_behavior_candidates_prefer_exact_native_object_id_without_device(
+    hass,
+    area_registry,
+    device_registry,
+    entity_registry,
+):
+    """A device-less native template light wins over its physical switch alias."""
+    area = area_registry.async_create("Garage and Guest Bathroom")
+    device_config_entry = MockConfigEntry(domain="adaptive_lighting_test")
+    device_config_entry.add_to_hass(hass)
+    native_ids = []
+    switch_alias_ids = []
+    for object_id in ("garage_light", "guest_bathroom_light"):
+        physical_device = device_registry.async_get_or_create(
+            config_entry_id=device_config_entry.entry_id,
+            identifiers={("adaptive_lighting_test", object_id)},
+        )
+        native = entity_registry.async_get_or_create(
+            LIGHT_DOMAIN,
+            "template",
+            object_id,
+            suggested_object_id=object_id,
+        )
+        native = entity_registry.async_update_entity(native.entity_id, area_id=area.id)
+        switch_alias = entity_registry.async_get_or_create(
+            SWITCH_DOMAIN,
+            "adaptive_lighting_test",
+            object_id,
+            device_id=physical_device.id,
+            suggested_object_id=object_id,
+        )
+        switch_alias = entity_registry.async_update_entity(
+            switch_alias.entity_id,
+            area_id=area.id,
+        )
+        assert native.device_id is None
+        assert switch_alias.device_id == physical_device.id
+        native_ids.append(native.entity_id)
+        switch_alias_ids.append(switch_alias.entity_id)
+        friendly_name = object_id.replace("_", " ").title()
+        hass.states.async_set(
+            native.entity_id,
+            STATE_OFF,
+            {"friendly_name": friendly_name},
+        )
+        hass.states.async_set(
+            switch_alias.entity_id,
+            STATE_OFF,
+            {"friendly_name": friendly_name},
+        )
+
+    dining = entity_registry.async_get_or_create(
+        SWITCH_DOMAIN,
+        "adaptive_lighting_test",
+        "dining_room_light",
+        suggested_object_id="dining_room_light",
+    )
+    dining = entity_registry.async_update_entity(dining.entity_id, area_id=area.id)
+    hass.states.async_set(dining.entity_id, STATE_OFF)
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    candidates = {
+        candidate.entity_id: candidate for candidate in switch._behavior_candidates()
+    }
+
+    assert set(native_ids).issubset(candidates)
+    assert not set(switch_alias_ids).intersection(candidates)
+    assert dining.entity_id in candidates
+
+
+@pytest.mark.parametrize(
+    ("native_state", "switch_state", "expected_domain"),
+    [
+        ("unavailable", STATE_OFF, SWITCH_DOMAIN),
+        (STATE_OFF, "unavailable", LIGHT_DOMAIN),
+        (STATE_OFF, STATE_OFF, LIGHT_DOMAIN),
+    ],
+)
+async def test_behavior_alias_dedupe_prefers_availability_then_native(
+    hass,
+    area_registry,
+    entity_registry,
+    native_state,
+    switch_state,
+    expected_domain,
+):
+    """Exact aliases prefer a live endpoint and native only on an equal tie."""
+    area = area_registry.async_create("Garage")
+    aliases = []
+    for domain, platform, state in (
+        (LIGHT_DOMAIN, "template", native_state),
+        (SWITCH_DOMAIN, "adaptive_lighting_test", switch_state),
+    ):
+        entry = entity_registry.async_get_or_create(
+            domain,
+            platform,
+            f"garage_{domain}",
+            suggested_object_id="garage_light",
+        )
+        entry = entity_registry.async_update_entity(entry.entity_id, area_id=area.id)
+        hass.states.async_set(
+            entry.entity_id,
+            state,
+            {"friendly_name": "Garage Light"},
+        )
+        aliases.append(entry.entity_id)
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    alias_candidates = [
+        candidate
+        for candidate in switch._behavior_candidates()
+        if candidate.entity_id in aliases
+    ]
+
+    assert len(alias_candidates) == 1
+    assert alias_candidates[0].domain == expected_domain
+
+
+async def test_behavior_alias_dedupe_preserves_different_area_or_name(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """An object ID alone is not proof that cross-area fixtures are aliases."""
+    garage = area_registry.async_create("Garage")
+    office = area_registry.async_create("Office")
+    native = entity_registry.async_get_or_create(
+        LIGHT_DOMAIN,
+        "template",
+        "shared_native",
+        suggested_object_id="shared_light",
+    )
+    native = entity_registry.async_update_entity(native.entity_id, area_id=garage.id)
+    switch_alias = entity_registry.async_get_or_create(
+        SWITCH_DOMAIN,
+        "adaptive_lighting_test",
+        "shared_switch",
+        suggested_object_id="shared_light",
+    )
+    switch_alias = entity_registry.async_update_entity(
+        switch_alias.entity_id,
+        area_id=office.id,
+    )
+    hass.states.async_set(
+        native.entity_id,
+        STATE_OFF,
+        {"friendly_name": "Garage Shared Light"},
+    )
+    hass.states.async_set(
+        switch_alias.entity_id,
+        STATE_OFF,
+        {"friendly_name": "Office Shared Light"},
+    )
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    candidates = {item.entity_id for item in switch._behavior_candidates()}
+
+    assert native.entity_id in candidates
+    assert switch_alias.entity_id in candidates
+
+
+async def test_behavior_candidates_exclude_integration_light_groups(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Integration groups are excluded, while a device-native group remains."""
+    area = area_registry.async_create("Grouped Lights")
+
+    def register_light(platform: str, unique_id: str, attributes=None):
+        entry = entity_registry.async_get_or_create(
+            LIGHT_DOMAIN,
+            platform,
+            unique_id,
+        )
+        entry = entity_registry.async_update_entity(entry.entity_id, area_id=area.id)
+        hass.states.async_set(entry.entity_id, STATE_OFF, attributes or {})
+        return entry
+
+    member = register_light("template", "group_member")
+    registry_group = register_light("group", "registry_group")
+    member_list_group = register_light(
+        "template",
+        "member_list_group",
+        {ATTR_ENTITY_ID: [member.entity_id]},
+    )
+    explicit_group = register_light(
+        "group",
+        "explicit_group",
+        {ATTR_ENTITY_ID: [member.entity_id]},
+    )
+    zigbee_group = register_light("zha", "zigbee_device_group")
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1, explicit_group.entity_id],
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    candidates = {
+        candidate.entity_id: candidate for candidate in switch._behavior_candidates()
+    }
+
+    assert member.entity_id in candidates
+    assert zigbee_group.entity_id in candidates
+    assert explicit_group.entity_id not in candidates
+    assert registry_group.entity_id not in candidates
+    assert member_list_group.entity_id not in candidates
+
+
+async def test_unconfigured_whole_house_candidate_remains_shadow_no_call(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Whole-house inventory learns unconfigured lights; runtime gates all calls."""
+    area = area_registry.async_create("Office")
+    office_lamp = entity_registry.async_get_or_create(
+        SWITCH_DOMAIN,
+        "adaptive_lighting_test",
+        "office_lamp",
+        suggested_object_id="office_lamp",
+    )
+    office_lamp = entity_registry.async_update_entity(
+        office_lamp.entity_id,
+        area_id=area.id,
+    )
+    hass.states.async_set(
+        office_lamp.entity_id,
+        STATE_OFF,
+        {"friendly_name": "Office Lamp"},
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    assert office_lamp.entity_id not in switch._behavior_configured_lights
+    assert office_lamp.entity_id in {
+        candidate.entity_id for candidate in switch._behavior_candidates()
+    }
+    service_events = []
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_events.append)
+    try:
+        await switch._behavior_runtime.async_evaluate()
+        await hass.async_block_till_done()
+    finally:
+        remove_listener()
+
+    assert not [
+        event
+        for event in service_events
+        if event.data.get(ATTR_DOMAIN) in {LIGHT_DOMAIN, SWITCH_DOMAIN}
+        and event.data.get(ATTR_SERVICE) in {SERVICE_TURN_ON, SERVICE_TURN_OFF}
+    ]
+
+
+async def test_behavior_candidates_keep_manual_hold_fixtures_for_learning(hass):
+    """Manual takeover keeps attribution while blocking per-entity actuation."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+
+    candidate = next(
+        candidate
+        for candidate in switch._behavior_candidates()
+        if candidate.entity_id == ENTITY_LIGHT_1
+    )
+
+    assert candidate.available is True
+    assert candidate.manual_hold is True
+    service_events = []
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_events.append)
+    try:
+        proposals = await switch._behavior_runtime.async_evaluate()
+        await hass.async_block_till_done()
+    finally:
+        remove_listener()
+
+    assert ENTITY_LIGHT_1 in switch._behavior_runtime.models
+    manual_proposal = next(
+        proposal for proposal in proposals if proposal.entity_id == ENTITY_LIGHT_1
+    )
+    assert manual_proposal.reason == "manual_hold_entity"
+    assert manual_proposal.executed is False
+    targeted_calls = []
+    for event in service_events:
+        service_data = event.data.get(ATTR_SERVICE_DATA, {})
+        targets = service_data.get(ATTR_ENTITY_ID, event.data.get(ATTR_ENTITY_ID))
+        if isinstance(targets, str):
+            targets = [targets]
+        if event.data.get(ATTR_SERVICE) in {
+            SERVICE_TURN_ON,
+            SERVICE_TURN_OFF,
+        } and ENTITY_LIGHT_1 in (targets or []):
+            targeted_calls.append(event)
+    assert not targeted_calls
+
+
+async def test_behavior_context_uses_latest_active_media_state(hass, entity_registry):
+    """The newest active player state wins over registry/snapshot ordering."""
+    old_media = _register_state_entity(
+        hass,
+        entity_registry,
+        "media_player",
+        "old_media",
+        "playing",
+        {"media_content_type": "movie", "app_name": "Plex"},
+    )
+    new_media = _register_state_entity(
+        hass,
+        entity_registry,
+        "media_player",
+        "new_media",
+        "paused",
+        {"media_content_type": "music", "app_name": "Spotify"},
+    )
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_MEDIA_ENTITIES: [old_media, new_media],
+        },
+    )
+
+    context = switch._behavior_context()
+
+    assert context["media"] == "music"
+    assert context["app_name"] == "Spotify"
+    assert context["media_content_type"] == "music"
+
+
+async def test_behavior_accepted_observation_forwards_to_commissioning(hass):
+    """Runtime acceptance is forwarded to the shared training gate."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    recorder = AsyncMock()
+    with patch.object(
+        switch._training,
+        "async_record_behavior_observation",
+        recorder,
+    ):
+        await switch._async_behavior_observation_accepted({"action": "on"})
+
+    recorder.assert_awaited_once_with({"action": "on"})
+
+
+async def test_behavior_shadow_runtime_makes_zero_service_calls(hass):
+    """Seven-day shadow behavior computes diagnostics without service calls."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+        },
+    )
+    service_events = []
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_events.append)
+    try:
+        await switch._behavior_runtime.async_evaluate()
+        await hass.async_block_till_done()
+    finally:
+        remove_listener()
+
+    assert switch._behavior_actuation_enabled() is False
+    assert not [
+        event
+        for event in service_events
+        if event.data.get(ATTR_DOMAIN) in {LIGHT_DOMAIN, SWITCH_DOMAIN}
+        and event.data.get(ATTR_SERVICE) in {SERVICE_TURN_ON, SERVICE_TURN_OFF}
+    ]
+
+
 async def test_intelligence_runtime_reconciles_new_removed_and_moved_entities(
     hass,
     area_registry,
     entity_registry,
 ):
-    """Registry changes update context inventory without adopting new actuators."""
+    """Registry changes update whole-house inventory without changing AL lights."""
     await setup_lights(hass)
     living = area_registry.async_create("Living")
     office = area_registry.async_create("Office")
@@ -1887,11 +2790,61 @@ async def test_intelligence_runtime_reconciles_new_removed_and_moved_entities(
     )
     assert candidate_item["explicit_controlled"] is False
     assert candidate.entity_id not in switch.lights
+    assert candidate.entity_id in {
+        item.entity_id for item in switch._behavior_candidates()
+    }
 
     entity_registry.async_update_entity(motion.entity_id, area_id=office.id)
     await hass.async_block_till_done()
     inventory = switch.extra_state_attributes["intelligence_discovery"]
+    assert motion.entity_id in {item["entity_id"] for item in inventory["entities"]}
+    assert any(item["entity_id"] == motion.entity_id for item in inventory["moved"])
+    moved_item = next(
+        item for item in inventory["entities"] if item["entity_id"] == motion.entity_id
+    )
+    assert moved_item["area"] == "Office"
+
+    entity_registry.async_remove(motion.entity_id)
+    await hass.async_block_till_done()
+    inventory = switch.extra_state_attributes["intelligence_discovery"]
     assert motion.entity_id in inventory["removed"]
+
+
+async def test_intelligence_discovery_diagnostics_bound_each_delta(hass):
+    """Every potentially noisy discovery delta is independently bounded."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    added = tuple(Mock(entity_id=f"light.added_{index}") for index in range(105))
+    removed = tuple(Mock(entity_id=f"light.removed_{index}") for index in range(106))
+    moved = tuple(
+        Mock(to_dict=Mock(return_value={"entity_id": f"light.moved_{index}"}))
+        for index in range(107)
+    )
+    renamed = tuple(
+        Mock(to_dict=Mock(return_value={"entity_id": f"light.renamed_{index}"}))
+        for index in range(108)
+    )
+    switch._discovery_snapshot = Mock(
+        revision=12,
+        reason="bounded_test",
+        monitored_area_ids=("office",),
+        entities=(),
+        added=added,
+        removed=removed,
+        moved=moved,
+        renamed=renamed,
+    )
+
+    diagnostics = switch.extra_state_attributes["intelligence_discovery"]
+
+    for key in ("added", "removed", "moved", "renamed"):
+        assert len(diagnostics[key]) == 100
+        assert diagnostics[f"{key}_truncated"] is True
 
 
 async def test_intelligence_active_mode_preserves_baseline_without_permission(hass):
