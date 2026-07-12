@@ -13,11 +13,19 @@ import pytest
 # package-relative imports.
 # ruff: noqa: E402
 _PACKAGE = "custom_components.adaptive_lighting"
-_PACKAGE_PATH = Path(__file__).parents[1] / "custom_components" / "adaptive_lighting"
-if _PACKAGE not in sys.modules:
+_PACKAGE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "custom_components"
+    / "adaptive_lighting"
+)
+if (package := sys.modules.get(_PACKAGE)) is None:
     package = types.ModuleType(_PACKAGE)
     package.__path__ = [str(_PACKAGE_PATH)]
     sys.modules[_PACKAGE] = package
+elif str(_PACKAGE_PATH) not in package.__path__:
+    # The full HA suite may have created this namespace from its symlinked core
+    # tree already. Keep the fork's pure modules available in both layouts.
+    package.__path__.append(str(_PACKAGE_PATH))
 
 from custom_components.adaptive_lighting.context import (
     ContextSignal,
