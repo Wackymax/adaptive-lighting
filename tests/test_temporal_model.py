@@ -1,5 +1,6 @@
 """Tests for the pure-Python temporal feature and action model layer."""
 
+import ast
 import json
 import sys
 from copy import deepcopy
@@ -16,6 +17,7 @@ sys.path.insert(
     ),
 )
 
+import temporal_model
 from temporal_model import (
     ActionProvenance,
     OnlineActionModel,
@@ -84,7 +86,13 @@ def test_encoder_is_pure_python_and_cyclic_at_midnight_boundary() -> None:
         ** 0.5
     )
     assert distance < 0.02
-    assert "homeassistant" not in sys.modules
+    imports: set[str] = set()
+    for node in ast.walk(ast.parse(Path(temporal_model.__file__).read_text())):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module)
+    assert not any(name.startswith("homeassistant") for name in imports)
 
 
 def test_recency_horizons_decay_at_different_rates() -> None:
