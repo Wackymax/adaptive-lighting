@@ -12,7 +12,7 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 _SCHEMA_VERSION = 1
@@ -32,19 +32,26 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _positive_int(value: Any) -> int | None:
+    """Return a positive integer without coercing floats or booleans."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _as_datetime(value: datetime | float | None) -> datetime:
     if value is None:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     timestamp = _number(value)
     if timestamp is None:
         raise ValueError
-    return datetime.fromtimestamp(timestamp, timezone.utc)
+    return datetime.fromtimestamp(timestamp, UTC)
 
 
 def _serializable_time(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat()
+    return value.astimezone(UTC).isoformat()
 
 
 class TransitionPrediction:
@@ -87,7 +94,7 @@ class TransitionPrediction:
     @property
     def is_expired(self) -> bool:
         """Return whether the prediction has expired at the current UTC time."""
-        return datetime.now(timezone.utc) >= self.expires_at
+        return datetime.now(UTC) >= self.expires_at
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-safe prediction explanation."""
@@ -117,6 +124,7 @@ class SequencePredictor:
         min_confidence: float = 0.0,
         prior_strength: float = 1.0,
         max_transition_gap_seconds: float = 900.0,
+        min_observations: int = 3,
         *,
         prelight_cap: float | None = None,
         expiry_s: float | None = None,
@@ -143,6 +151,8 @@ class SequencePredictor:
             raise ValueError
         if gap is None or gap <= 0:
             raise ValueError
+        if _positive_int(min_observations) is None:
+            raise ValueError
 
         self.prelight_brightness_cap = cap
         self.expiry_seconds = expiry
@@ -150,8 +160,10 @@ class SequencePredictor:
         self.min_confidence = confidence
         self.prior_strength = prior
         self.max_transition_gap_seconds = gap
+        self.min_observations = min_observations
         self._bucket_counts: defaultdict[
-            tuple[str, str], defaultdict[str, int],
+            tuple[str, str],
+            defaultdict[str, int],
         ] = defaultdict(lambda: defaultdict(int))
         self._global_counts: defaultdict[str, defaultdict[str, int]] = defaultdict(
             lambda: defaultdict(int),
@@ -222,8 +234,12 @@ class SequencePredictor:
 
     def cap_brightness(self, requested_brightness: float | None) -> float:
         """Clamp a predicted pre-light request to the configured low cap."""
-        requested = self.prelight_brightness_cap if requested_brightness is None else _number(
-            requested_brightness,
+        requested = (
+            self.prelight_brightness_cap
+            if requested_brightness is None
+            else _number(
+                requested_brightness,
+            )
         )
         if requested is None:
             raise ValueError
@@ -251,7 +267,9 @@ class SequencePredictor:
         if timestamp is not None:
             at = timestamp
         moment = _as_datetime(at)
-        bucket = _zone(time_bucket) if time_bucket is not None else self.time_bucket(moment)
+        bucket = (
+            _zone(time_bucket) if time_bucket is not None else self.time_bucket(moment)
+        )
         if not bucket:
             return None
         counts = self._bucket_counts.get((source, bucket), {})
@@ -273,7 +291,11 @@ class SequencePredictor:
                 ) / (bucket_total + self.prior_strength)
             scored.append((score, target))
         confidence, target = max(scored, key=lambda item: (item[0], item[1]))
-        if confidence < self.min_confidence:
+        target_observations = global_counts[target]
+        if (
+            confidence < self.min_confidence
+            or target_observations < self.min_observations
+        ):
             return None
 
         return TransitionPrediction(
@@ -285,7 +307,7 @@ class SequencePredictor:
                 brightness if brightness is not None else requested_brightness,
             ),
             time_bucket=bucket,
-            observations=global_total,
+            observations=target_observations,
         )
 
     predict_next = predict
@@ -316,6 +338,7 @@ class SequencePredictor:
                 "expiry_seconds": self.expiry_seconds,
                 "bucket_minutes": self.bucket_minutes,
                 "min_confidence": self.min_confidence,
+                "min_observations": self.min_observations,
                 "prior_strength": self.prior_strength,
                 "max_transition_gap_seconds": self.max_transition_gap_seconds,
             },
@@ -339,8 +362,101 @@ class SequencePredictor:
         """Import a predictor from a JSON string."""
         self.import_state(json.loads(payload), replace=replace)
 
+    def _import_configuration(self, config: Any) -> SequencePredictor:
+        if not isinstance(config, Mapping):
+            raise TypeError
+        return type(self)(
+            prelight_brightness_cap=config.get(
+                "prelight_brightness_cap",
+                self.prelight_brightness_cap,
+            ),
+            expiry_seconds=config.get("expiry_seconds", self.expiry_seconds),
+            bucket_minutes=config.get("bucket_minutes", self.bucket_minutes),
+            min_confidence=config.get("min_confidence", self.min_confidence),
+            prior_strength=config.get("prior_strength", self.prior_strength),
+            max_transition_gap_seconds=config.get(
+                "max_transition_gap_seconds",
+                self.max_transition_gap_seconds,
+            ),
+            min_observations=config.get(
+                "min_observations",
+                self.min_observations,
+            ),
+        )
+
+    def _import_counts(
+        self,
+        entries: list[Any],
+        replace: bool,
+    ) -> dict[tuple[str, str], dict[str, int]]:
+        imported = (
+            {}
+            if replace
+            else {key: dict(counts) for key, counts in self._bucket_counts.items()}
+        )
+        seen = {
+            (source, bucket, target)
+            for (source, bucket), counts in imported.items()
+            for target in counts
+        }
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise TypeError
+            source = _zone(entry.get("from_zone"))
+            target = _zone(entry.get("to_zone"))
+            bucket = _zone(entry.get("time_bucket"))
+            count = _positive_int(entry.get("count"))
+            transition = (source, bucket, target)
+            if (
+                not source
+                or not target
+                or not bucket
+                or source == target
+                or count is None
+                or transition in seen
+            ):
+                raise ValueError
+            imported.setdefault((source, bucket), {})[target] = count
+            seen.add(transition)
+        return imported
+
+    def _import_cursor(
+        self,
+        payload: Mapping[str, Any],
+        replace: bool,
+    ) -> tuple[str | None, datetime | None]:
+        last_zone = None if replace else self._last_zone
+        last_at = None if replace else self._last_at
+        if "last_event" not in payload:
+            return last_zone, last_at
+        last_event = payload["last_event"]
+        if last_event is None:
+            return None, None
+        if not isinstance(last_event, Mapping):
+            raise TypeError
+        zone = _zone(last_event.get("zone"))
+        at = last_event.get("at")
+        if not zone or not isinstance(at, str):
+            raise ValueError
+        try:
+            parsed_at = _as_datetime(datetime.fromisoformat(at))
+        except ValueError as err:
+            raise ValueError from err
+        return zone, parsed_at
+
+    @staticmethod
+    def _global_counts_from_import(
+        imported: Mapping[tuple[str, str], Mapping[str, int]],
+    ) -> dict[str, dict[str, int]]:
+        global_counts: dict[str, dict[str, int]] = {}
+        for (source, _bucket), counts in imported.items():
+            source_counts = global_counts.setdefault(source, {})
+            for target, count in counts.items():
+                source_counts[target] = source_counts.get(target, 0) + count
+        return global_counts
+
     def import_state(self, payload: Mapping[str, Any], *, replace: bool = True) -> None:
-        """Import state previously returned by :meth:`export_state`."""
+        """Atomically import state previously returned by :meth:`export_state`."""
         if not isinstance(payload, Mapping):
             raise TypeError
         version = payload.get("version", _SCHEMA_VERSION)
@@ -349,58 +465,26 @@ class SequencePredictor:
         entries = payload.get("entries", [])
         if not isinstance(entries, list):
             raise TypeError
-        config = payload.get("config", {})
-        if isinstance(config, Mapping):
-            configured = type(self)(
-                prelight_brightness_cap=config.get(
-                    "prelight_brightness_cap",
-                    self.prelight_brightness_cap,
-                ),
-                expiry_seconds=config.get("expiry_seconds", self.expiry_seconds),
-                bucket_minutes=config.get("bucket_minutes", self.bucket_minutes),
-                min_confidence=config.get("min_confidence", self.min_confidence),
-                prior_strength=config.get("prior_strength", self.prior_strength),
-                max_transition_gap_seconds=config.get(
-                    "max_transition_gap_seconds",
-                    self.max_transition_gap_seconds,
-                ),
-            )
-            self.prelight_brightness_cap = configured.prelight_brightness_cap
-            self.expiry_seconds = configured.expiry_seconds
-            self.bucket_minutes = configured.bucket_minutes
-            self.min_confidence = configured.min_confidence
-            self.prior_strength = configured.prior_strength
-            self.max_transition_gap_seconds = configured.max_transition_gap_seconds
-        if replace:
-            self._bucket_counts.clear()
-            self._global_counts.clear()
-            self._last_zone = None
-            self._last_at = None
+        configured = self._import_configuration(payload.get("config", {}))
+        imported = self._import_counts(entries, replace)
+        last_zone, last_at = self._import_cursor(payload, replace)
+        global_counts = self._global_counts_from_import(imported)
 
-        for entry in entries:
-            if not isinstance(entry, Mapping):
-                continue
-            source = _zone(entry.get("from_zone"))
-            target = _zone(entry.get("to_zone"))
-            bucket = _zone(entry.get("time_bucket"))
-            count = _number(entry.get("count", 0))
-            if not source or not target or not bucket or count is None or count < 1:
-                continue
-            whole_count = int(count)
-            self._bucket_counts[(source, bucket)][target] += whole_count
-            self._global_counts[source][target] += whole_count
-
-        last_event = payload.get("last_event")
-        if isinstance(last_event, Mapping):
-            zone = _zone(last_event.get("zone"))
-            at = last_event.get("at")
-            if zone and isinstance(at, str):
-                try:
-                    self._last_zone = zone
-                    self._last_at = _as_datetime(datetime.fromisoformat(at))
-                except ValueError:
-                    self._last_zone = None
-                    self._last_at = None
+        self.prelight_brightness_cap = configured.prelight_brightness_cap
+        self.expiry_seconds = configured.expiry_seconds
+        self.bucket_minutes = configured.bucket_minutes
+        self.min_confidence = configured.min_confidence
+        self.prior_strength = configured.prior_strength
+        self.max_transition_gap_seconds = configured.max_transition_gap_seconds
+        self.min_observations = configured.min_observations
+        self._bucket_counts = defaultdict(lambda: defaultdict(int))
+        for key, counts in imported.items():
+            self._bucket_counts[key].update(counts)
+        self._global_counts = defaultdict(lambda: defaultdict(int))
+        for source, counts in global_counts.items():
+            self._global_counts[source].update(counts)
+        self._last_zone = last_zone
+        self._last_at = last_at
 
     @classmethod
     def from_state(cls, payload: Mapping[str, Any]) -> SequencePredictor:
@@ -414,6 +498,7 @@ class SequencePredictor:
             bucket_minutes=config.get("bucket_minutes", 60),
             min_confidence=config.get("min_confidence", 0.0),
             prior_strength=config.get("prior_strength", 1.0),
+            min_observations=config.get("min_observations", 3),
             max_transition_gap_seconds=config.get(
                 "max_transition_gap_seconds",
                 900.0,
@@ -431,14 +516,16 @@ class SequencePredictor:
         """Reset all transitions or transitions touching the selected zones."""
         source_filter = _zone(from_zone) if from_zone is not None else None
         target_filter = _zone(to_zone) if to_zone is not None else None
+        # Any reset starts a new observation sequence. Keeping this cursor could
+        # immediately recreate a transition that the caller just removed.
+        self._last_zone = None
+        self._last_at = None
         if source_filter is None and target_filter is None:
             removed = sum(
                 sum(counts.values()) for counts in self._bucket_counts.values()
             )
             self._bucket_counts.clear()
             self._global_counts.clear()
-            self._last_zone = None
-            self._last_at = None
             return removed
 
         removed = 0

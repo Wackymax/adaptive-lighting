@@ -33,12 +33,19 @@ _SAFETY_INTENTS = frozenset(
     {
         "alarm",
         "emergency",
+        "evacuation",
+        "fire",
         "good_night",
         "grid_emergency",
+        "night_path",
         "night_safety",
         "safety",
+        "security",
+        "sleep",
     },
 )
+
+
 def _text(value: Any, *, default: str = "") -> str:
     """Return a normalized, non-empty string or a default."""
     if not isinstance(value, str):
@@ -65,6 +72,13 @@ def _mapping_value(mapping: Mapping[str, Any], *names: str) -> Any:
     return None
 
 
+def _positive_int(value: Any) -> int | None:
+    """Return a positive integer without coercing floats or booleans."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 class OverrideSample:
     """A user change that may become preference-learning evidence.
 
@@ -77,6 +91,7 @@ class OverrideSample:
         "baseline",
         "daylight_band",
         "duration_seconds",
+        "hard_cap",
         "intent",
         "safety_context",
         "selected",
@@ -96,6 +111,7 @@ class OverrideSample:
         time_bucket: str = _DEFAULT_TIME_BUCKET,
         daylight_band: str = _DEFAULT_DAYLIGHT_BAND,
         safety_context: bool = False,
+        hard_cap: float | bool | None = None,
         *,
         previous_target: float | None = None,
         previous_brightness: float | None = None,
@@ -106,6 +122,8 @@ class OverrideSample:
         duration: float | None = None,
         context: str | None = None,
         actor: str | None = None,
+        hard_brightness_cap: float | bool | None = None,
+        hard_cap_active: bool | None = None,
     ) -> None:
         """Build a sample, accepting the plan's previous-target terminology."""
         if baseline is None:
@@ -126,10 +144,15 @@ class OverrideSample:
             intent = context
         if actor is not None:
             source = actor
+        if hard_cap is None:
+            hard_cap = hard_brightness_cap
+        if hard_cap is None:
+            hard_cap = hard_cap_active
         self.zone = zone
         self.baseline = baseline
         self.selected = selected
         self.duration_seconds = duration_seconds
+        self.hard_cap = hard_cap
         self.source = source
         self.intent = intent
         self.time_bucket = time_bucket
@@ -153,6 +176,7 @@ class OverrideSample:
             "baseline": self.baseline,
             "selected": self.selected,
             "duration_seconds": self.duration_seconds,
+            "hard_cap": self.hard_cap,
             "source": self.source,
             "intent": self.intent,
             "time_bucket": self.time_bucket,
@@ -214,26 +238,16 @@ class PreferenceLearner:
 
     @staticmethod
     def _is_human_source(source: Any) -> bool:
-        normalized = _text(source)
-        if normalized in _HUMAN_SOURCES:
-            return True
-        return normalized.startswith(
-            (
-                "human:",
-                "human_",
-                "manual:",
-                "manual_",
-                "physical:",
-                "physical_",
-            ),
-        )
+        return _text(source) in _HUMAN_SOURCES
 
     @staticmethod
     def _is_safety_context(sample: OverrideSample) -> bool:
         intent = _text(sample.intent)
         return bool(sample.safety_context) or intent in _SAFETY_INTENTS
 
-    def _coerce_sample(self, sample: OverrideSample | Mapping[str, Any]) -> OverrideSample | None:
+    def _coerce_sample(
+        self, sample: OverrideSample | Mapping[str, Any]
+    ) -> OverrideSample | None:
         if isinstance(sample, OverrideSample):
             return sample
         if not isinstance(sample, Mapping):
@@ -272,6 +286,14 @@ class PreferenceLearner:
                 "safety_context",
                 sample.get("is_safety_context", sample.get("safety", False)),
             ),
+            hard_cap=_mapping_value(
+                sample,
+                "hard_cap",
+                "hard_brightness_cap",
+                "brightness_cap",
+                "hard_cap_active",
+                "has_hard_cap",
+            ),
         )
 
     def record(self, sample: OverrideSample | Mapping[str, Any]) -> bool:
@@ -290,6 +312,10 @@ class PreferenceLearner:
         baseline = _finite_number(sample.baseline)
         selected = _finite_number(sample.selected)
         duration = _finite_number(sample.duration_seconds)
+        hard_cap_active = sample.hard_cap is True
+        hard_cap = None
+        if sample.hard_cap is not None and not isinstance(sample.hard_cap, bool):
+            hard_cap = _finite_number(sample.hard_cap)
         if (
             baseline is None
             or selected is None
@@ -297,7 +323,15 @@ class PreferenceLearner:
             or not 0 <= baseline <= 100
             or not 0 <= selected <= 100
             or duration < self.min_duration_seconds
+            or (
+                sample.hard_cap is not None
+                and not isinstance(sample.hard_cap, bool)
+                and hard_cap is None
+            )
+            or (hard_cap is not None and not 0 <= hard_cap <= 100)
         ):
+            return False
+        if (hard_cap_active or hard_cap is not None) and selected > baseline:
             return False
 
         key = self._key(
@@ -309,8 +343,10 @@ class PreferenceLearner:
         if key is None:
             return False
 
-        observed_offset = max(-self.max_offset, min(self.max_offset, selected - baseline))
-        state = self._offsets.setdefault(key, {"offset": 0.0, "count": 0.0})
+        observed_offset = max(
+            -self.max_offset, min(self.max_offset, selected - baseline)
+        )
+        state = self._offsets.setdefault(key, {"offset": 0.0, "count": 0})
         state["offset"] = max(
             -self.max_offset,
             min(
@@ -348,18 +384,25 @@ class PreferenceLearner:
         intent: str = _DEFAULT_INTENT,
         time_bucket: str = _DEFAULT_TIME_BUCKET,
         daylight_band: str = _DEFAULT_DAYLIGHT_BAND,
+        *,
+        hard_cap: float | None = None,
     ) -> float:
         """Apply a learned offset while keeping the target in 0--100."""
         value = _finite_number(baseline)
         if value is None:
             raise ValueError
-        value = max(0.0, min(100.0, value))
+        cap = 100.0
+        if hard_cap is not None:
+            cap_value = _finite_number(hard_cap)
+            if cap_value is None or not 0 <= cap_value <= 100:
+                raise ValueError
+            cap = cap_value
+        value = max(0.0, min(cap, value))
         return max(
             0.0,
             min(
-                100.0,
-                value
-                + self.get_offset(zone, intent, time_bucket, daylight_band),
+                cap,
+                value + self.get_offset(zone, intent, time_bucket, daylight_band),
             ),
         )
 
@@ -410,7 +453,7 @@ class PreferenceLearner:
         self.import_state(json.loads(payload), replace=replace)
 
     def import_state(self, payload: Mapping[str, Any], *, replace: bool = True) -> None:
-        """Import state previously returned by :meth:`export_state`."""
+        """Atomically import state previously returned by :meth:`export_state`."""
         if not isinstance(payload, Mapping):
             raise TypeError
         version = payload.get("version", _SCHEMA_VERSION)
@@ -420,24 +463,28 @@ class PreferenceLearner:
         if not isinstance(entries, list):
             raise TypeError
         config = payload.get("config", {})
-        if isinstance(config, Mapping):
-            configured = type(self)(
-                learning_rate=config.get("learning_rate", self.learning_rate),
-                max_offset=config.get("max_offset", self.max_offset),
-                min_duration_seconds=config.get(
-                    "min_duration_seconds",
-                    self.min_duration_seconds,
-                ),
-            )
-            self.learning_rate = configured.learning_rate
-            self.max_offset = configured.max_offset
-            self.min_duration_seconds = configured.min_duration_seconds
-        if replace:
-            self._offsets.clear()
+        if not isinstance(config, Mapping):
+            raise TypeError
+        configured = type(self)(
+            learning_rate=config.get("learning_rate", self.learning_rate),
+            max_offset=config.get("max_offset", self.max_offset),
+            min_duration_seconds=config.get(
+                "min_duration_seconds",
+                self.min_duration_seconds,
+            ),
+        )
+        imported = (
+            {}
+            if replace
+            else {key: state.copy() for key, state in self._offsets.items()}
+        )
+        for state in imported.values():
+            if abs(state["offset"]) > configured.max_offset:
+                raise ValueError
 
         for entry in entries:
             if not isinstance(entry, Mapping):
-                continue
+                raise TypeError
             key = self._key(
                 entry.get("zone"),
                 entry.get("intent"),
@@ -445,13 +492,22 @@ class PreferenceLearner:
                 entry.get("daylight_band"),
             )
             offset = _finite_number(entry.get("offset"))
-            count = _finite_number(entry.get("count", 0))
-            if key is None or offset is None or count is None or count < 0:
-                continue
-            self._offsets[key] = {
-                "offset": max(-self.max_offset, min(self.max_offset, offset)),
-                "count": float(int(count)),
-            }
+            count = _positive_int(entry.get("count"))
+            if (
+                key is None
+                or key[1] in _SAFETY_INTENTS
+                or offset is None
+                or abs(offset) > configured.max_offset
+                or count is None
+                or key in imported
+            ):
+                raise ValueError
+            imported[key] = {"offset": offset, "count": count}
+
+        self.learning_rate = configured.learning_rate
+        self.max_offset = configured.max_offset
+        self.min_duration_seconds = configured.min_duration_seconds
+        self._offsets = imported
 
     @classmethod
     def from_state(cls, payload: Mapping[str, Any]) -> PreferenceLearner:
