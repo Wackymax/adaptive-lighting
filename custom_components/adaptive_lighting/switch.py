@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import math
 import zoneinfo
@@ -222,6 +223,135 @@ except ImportError:  # `get_astral_observer` was added in HA 2026.7
 
 
 _LOGGER = logging.getLogger(__name__)
+
+# Full discovery state remains in the coordinator and persisted learner. Only
+# this compact, recent window is attached to the switch state because Recorder
+# rejects attributes larger than 16 KiB and would otherwise log on every update
+# in a large Home Assistant installation.
+MAX_STATE_DIAGNOSTIC_ITEMS = 8
+MAX_STATE_INTELLIGENCE_DECISIONS = 8
+MAX_STATE_SAMPLE_COUNTS = 32
+MAX_STATE_ATTRIBUTE_BYTES = 14_000
+
+
+def _state_attribute_size(attributes: Mapping[str, Any]) -> int:
+    """Estimate Recorder's compact JSON payload size for state attributes."""
+    return len(
+        json.dumps(attributes, default=str, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
+    attributes: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail small when unusual user data would exceed Recorder's hard limit.
+
+    Normal installations retain the complete bounded projection. This fallback
+    affects state telemetry only; configuration, coordinator inventory, and
+    learned models remain complete in their authoritative in-memory/storage
+    locations.
+    """
+    if _state_attribute_size(attributes) <= MAX_STATE_ATTRIBUTE_BYTES:
+        return attributes
+
+    attributes["state_attributes_truncated"] = True
+    attributes["configuration"] = {}
+    attributes["configuration_truncated"] = True
+    for key in ("manual_control",):
+        value = attributes.get(key)
+        if isinstance(value, list):
+            attributes[key] = value[:MAX_STATE_DIAGNOSTIC_ITEMS]
+    timers = attributes.get("autoreset_time_remaining")
+    if isinstance(timers, Mapping):
+        attributes["autoreset_time_remaining"] = dict(
+            sorted(timers.items())[:MAX_STATE_DIAGNOSTIC_ITEMS],
+        )
+
+    decisions = attributes.get("intelligence_decisions")
+    if isinstance(decisions, Mapping):
+        compact_decisions: dict[str, dict[str, Any]] = {}
+        decision_keys = (
+            "intent",
+            "baseline_brightness_pct",
+            "target_brightness_pct",
+            "confidence",
+            "reason",
+            "can_adjust",
+            "can_turn_on",
+            "can_turn_off",
+        )
+        for entity_id, decision in sorted(decisions.items())[
+            :MAX_STATE_DIAGNOSTIC_ITEMS
+        ]:
+            if isinstance(decision, Mapping):
+                compact_decisions[str(entity_id)] = {
+                    key: decision[key] for key in decision_keys if key in decision
+                }
+        attributes["intelligence_decisions"] = compact_decisions
+        attributes["intelligence_decisions_compacted"] = True
+
+    discovery = attributes.get("intelligence_discovery")
+    if isinstance(discovery, dict):
+        discovery["areas"] = list(discovery.get("areas", []))[
+            :MAX_STATE_DIAGNOSTIC_ITEMS
+        ]
+        for key in ("entities", "added", "removed", "moved", "renamed"):
+            discovery[key] = list(discovery.get(key, []))[:MAX_STATE_DIAGNOSTIC_ITEMS]
+        discovery["truncated"] = True
+
+    if _state_attribute_size(attributes) <= MAX_STATE_ATTRIBUTE_BYTES:
+        return attributes
+
+    # Last-resort scalar summary guarantees a bounded state even with extreme
+    # custom names or user-provided strings. Authoritative state is untouched.
+    summary: dict[str, Any] = {
+        "configuration": {},
+        "configuration_truncated": True,
+        "state_attributes_truncated": True,
+    }
+    for key, value in attributes.items():
+        if isinstance(value, str):
+            summary[key] = value[:256]
+        elif value is None or isinstance(value, bool | int | float):
+            summary[key] = value
+    for key, allowed in {
+        "intelligence": ("enabled", "configured_shadow_mode", "shadow_mode"),
+        "intelligence_training": (
+            "active",
+            "phase",
+            "training_deadline",
+            "remaining_seconds",
+            "confidence",
+            "promotion_reason",
+        ),
+        "intelligence_behavior": (
+            "phase",
+            "models",
+            "candidates",
+            "available_candidates",
+            "accepted_observations",
+            "pending",
+            "corrections",
+            "suppression",
+            "shadow_ready",
+            "shadow_executed",
+            "actuation_enabled",
+        ),
+        "intelligence_discovery": ("revision", "reason", "entity_count"),
+    }.items():
+        value = attributes.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        summary[key] = {
+            item: (value[item][:256] if isinstance(value[item], str) else value[item])
+            for item in allowed
+            if item in value
+            and (
+                isinstance(value[item], str | bool | int | float) or value[item] is None
+            )
+        }
+    return summary
+
 
 SCAN_INTERVAL = timedelta(seconds=10)
 
@@ -3099,6 +3229,14 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         extra_state_attributes: dict[str, Any] = {"configuration": self._config}
         if self._behavior_runtime is not None:
             behavior = self._behavior_runtime.diagnostics
+            sample_counts = behavior.get("sample_counts")
+            if isinstance(sample_counts, Mapping):
+                behavior["sample_counts"] = dict(
+                    sorted(sample_counts.items())[:MAX_STATE_SAMPLE_COUNTS],
+                )
+                behavior["sample_counts_truncated"] = (
+                    len(sample_counts) > MAX_STATE_SAMPLE_COUNTS
+                )
             decisions = behavior.get("last_decisions", [])
             behavior["shadow_ready"] = sum(
                 bool(item.get("ready"))
@@ -3115,19 +3253,27 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if not self.is_on:
             for key in self._settings:
                 extra_state_attributes[key] = None
-            return extra_state_attributes
+            return _fit_state_attribute_budget(extra_state_attributes)
         extra_state_attributes["manual_control"] = [
             light for light in self.lights if self.manager.manual_control.get(light)
         ]
         extra_state_attributes.update(self._settings)
         if self._intelligence_enabled:
             decisions = self._intelligence_decisions
+            exposed_decisions = dict(
+                sorted(decisions.items())[:MAX_STATE_INTELLIGENCE_DECISIONS],
+            )
             extra_state_attributes["intelligence"] = {
                 "enabled": True,
                 "configured_shadow_mode": self._intelligence_shadow_mode,
                 "shadow_mode": self._intelligence_shadow_actuation_blocked,
             }
-            extra_state_attributes["intelligence_decisions"] = deepcopy(decisions)
+            extra_state_attributes["intelligence_decisions"] = deepcopy(
+                exposed_decisions,
+            )
+            extra_state_attributes["intelligence_decisions_truncated"] = (
+                len(decisions) > MAX_STATE_INTELLIGENCE_DECISIONS
+            )
             if self._training is not None:
                 extra_state_attributes["intelligence_training"] = (
                     self._training.summary()
@@ -3147,17 +3293,37 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                             "status": item.status,
                             "explicit_controlled": item.explicit_controlled,
                         }
-                        for item in snapshot.entities[:100]
+                        for item in snapshot.entities[:MAX_STATE_DIAGNOSTIC_ITEMS]
                     ],
-                    "added": [item.entity_id for item in snapshot.added[:100]],
-                    "removed": [item.entity_id for item in snapshot.removed[:100]],
-                    "moved": [item.to_dict() for item in snapshot.moved[:100]],
-                    "renamed": [item.to_dict() for item in snapshot.renamed[:100]],
-                    "added_truncated": len(snapshot.added) > 100,
-                    "removed_truncated": len(snapshot.removed) > 100,
-                    "moved_truncated": len(snapshot.moved) > 100,
-                    "renamed_truncated": len(snapshot.renamed) > 100,
-                    "truncated": len(snapshot.entities) > 100,
+                    "added": [
+                        item.entity_id
+                        for item in snapshot.added[:MAX_STATE_DIAGNOSTIC_ITEMS]
+                    ],
+                    "removed": [
+                        item.entity_id
+                        for item in snapshot.removed[:MAX_STATE_DIAGNOSTIC_ITEMS]
+                    ],
+                    "moved": [
+                        item.to_dict()
+                        for item in snapshot.moved[:MAX_STATE_DIAGNOSTIC_ITEMS]
+                    ],
+                    "renamed": [
+                        item.to_dict()
+                        for item in snapshot.renamed[:MAX_STATE_DIAGNOSTIC_ITEMS]
+                    ],
+                    "added_truncated": (
+                        len(snapshot.added) > MAX_STATE_DIAGNOSTIC_ITEMS
+                    ),
+                    "removed_truncated": (
+                        len(snapshot.removed) > MAX_STATE_DIAGNOSTIC_ITEMS
+                    ),
+                    "moved_truncated": (
+                        len(snapshot.moved) > MAX_STATE_DIAGNOSTIC_ITEMS
+                    ),
+                    "renamed_truncated": (
+                        len(snapshot.renamed) > MAX_STATE_DIAGNOSTIC_ITEMS
+                    ),
+                    "truncated": (len(snapshot.entities) > MAX_STATE_DIAGNOSTIC_ITEMS),
                 }
         timers = self.manager.auto_reset_manual_control_timers
         extra_state_attributes["autoreset_time_remaining"] = {
@@ -3165,7 +3331,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             for light in self.lights
             if (timer := timers.get(light)) and (time := timer.remaining_time()) > 0
         }
-        return extra_state_attributes
+        return _fit_state_attribute_budget(extra_state_attributes)
 
     def create_context(
         self,

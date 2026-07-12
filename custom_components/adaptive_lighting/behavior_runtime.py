@@ -49,7 +49,11 @@ STORAGE_VERSION = 1
 DATA_VERSION = 2
 DEFAULT_STORAGE_KEY = "adaptive_lighting_behavior_runtime"
 MAX_ENTITIES = 128
-MAX_DIAGNOSTIC_DECISIONS = 32
+# State attributes are persisted by Home Assistant Recorder. Keep the recent
+# explanation window useful for the dashboard while leaving ample room below
+# Recorder's 16 KiB per-state attribute ceiling once configuration, training,
+# and discovery summaries are included.
+MAX_DIAGNOSTIC_DECISIONS = 12
 MAX_TRACKED_CONTEXTS = 512
 MAX_TRACKED_STATES = 256
 MAX_CONTEXT_AGE = timedelta(minutes=10)
@@ -608,6 +612,11 @@ class BehaviorRuntimeAdapter:
                 else None
             ),
         }
+
+    def _remember_decision(self, decision: Mapping[str, Any]) -> None:
+        """Retain only the most recent state-attribute explanation window."""
+        self._last_decisions.append(dict(decision))
+        self._last_decisions = self._last_decisions[-MAX_DIAGNOSTIC_DECISIONS:]
 
     @property
     def summary(self) -> Mapping[str, Any]:
@@ -1504,7 +1513,7 @@ class BehaviorRuntimeAdapter:
                 "strong_negative_correction",
                 "negative_correction",
             }:
-                self._last_decisions.append(
+                self._remember_decision(
                     {
                         "entity_id": record.entity_id,
                         "action": result.action,
@@ -1516,7 +1525,6 @@ class BehaviorRuntimeAdapter:
                         ),
                     },
                 )
-                self._last_decisions = self._last_decisions[-MAX_DIAGNOSTIC_DECISIONS:]
 
     def _new_model(self) -> OnlineActionModel:
         encoder = TemporalFeatureEncoder(
@@ -2009,8 +2017,7 @@ class BehaviorRuntimeAdapter:
                     executed=False,
                 )
                 proposals.append(proposal)
-                self._last_decisions.append(proposal.as_dict())
-                self._last_decisions = self._last_decisions[-MAX_DIAGNOSTIC_DECISIONS:]
+                self._remember_decision(proposal.as_dict())
                 record.last_access = self._next_access()
                 continue
             current = self._current_state(entity_id)
@@ -2093,8 +2100,7 @@ class BehaviorRuntimeAdapter:
                 executed,
             )
             proposals.append(proposal)
-            self._last_decisions.append(proposal.as_dict())
-            self._last_decisions = self._last_decisions[-MAX_DIAGNOSTIC_DECISIONS:]
+            self._remember_decision(proposal.as_dict())
             record.last_access = self._next_access()
         if proposals or changed:
             await self._persist()

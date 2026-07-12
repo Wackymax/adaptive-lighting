@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import datetime
+import json
 import logging
 from collections import OrderedDict
 from copy import deepcopy
@@ -82,6 +83,10 @@ from homeassistant.components.adaptive_lighting.const import (
 )
 from homeassistant.components.adaptive_lighting.switch import (
     CONF_INTERCEPT,
+    MAX_STATE_ATTRIBUTE_BYTES,
+    MAX_STATE_DIAGNOSTIC_ITEMS,
+    MAX_STATE_INTELLIGENCE_DECISIONS,
+    MAX_STATE_SAMPLE_COUNTS,
     AdaptiveLightingManager,
     AdaptiveSwitch,
     SimpleSwitch,
@@ -2843,8 +2848,115 @@ async def test_intelligence_discovery_diagnostics_bound_each_delta(hass):
     diagnostics = switch.extra_state_attributes["intelligence_discovery"]
 
     for key in ("added", "removed", "moved", "renamed"):
-        assert len(diagnostics[key]) == 100
+        assert len(diagnostics[key]) == MAX_STATE_DIAGNOSTIC_ITEMS
         assert diagnostics[f"{key}_truncated"] is True
+
+
+async def test_intelligence_state_attributes_stay_below_recorder_limit(hass):
+    """Large homes expose summaries without exceeding Recorder's 16 KiB cap."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    entities = tuple(
+        Mock(
+            entity_id=f"binary_sensor.long_context_entity_{index:04d}",
+            area_name=f"Large Area {index:04d}",
+            area_id=f"large_area_{index:04d}",
+            capabilities=("binary_sensor", "opening", "context"),
+            status="available",
+            explicit_controlled=False,
+        )
+        for index in range(636)
+    )
+    switch._discovery_snapshot = Mock(
+        revision=24,
+        reason="large_home_test",
+        monitored_area_ids=tuple(f"area_{index}" for index in range(20)),
+        entities=entities,
+        added=entities,
+        removed=entities,
+        moved=(),
+        renamed=(),
+    )
+    behavior = {
+        "phase": "shadow_learning",
+        "models": 128,
+        "candidates": 128,
+        "available_candidates": 128,
+        "sample_counts": {
+            f"light.long_behavior_candidate_{index:04d}": index for index in range(128)
+        },
+        "last_decisions": [
+            {
+                "entity_id": f"light.long_behavior_candidate_{index:04d}",
+                "area": f"Large Area {index:04d}",
+                "domain": "light",
+                "service": "turn_on",
+                "action": "on",
+                "probability": 0.987654,
+                "confidence": 0.876543,
+                "effective_support": 123.456,
+                "active": False,
+                "ready": False,
+                "executed": False,
+                "fresh": True,
+                "reason": "shadow_mode_requires_no_actuation",
+                "proposal_id": None,
+            }
+            for index in range(12)
+        ],
+        "pending": 0,
+        "corrections": 0,
+        "suppression": 0,
+    }
+    switch._config = {
+        "lights": [f"light.long_configured_light_{index:04d}" for index in range(128)],
+        "occupancy_entities": [
+            f"binary_sensor.long_occupancy_{index:04d}" for index in range(128)
+        ],
+    }
+    switch._intelligence_decisions = {
+        f"light.long_configured_light_{index:04d}": {
+            "intent": "ambient",
+            "baseline_brightness_pct": 50,
+            "target_brightness_pct": 30,
+            "confidence": 0.876543,
+            "reason": "context-aware bounded state projection",
+            "can_adjust": False,
+            "can_turn_on": False,
+            "can_turn_off": False,
+            "provenance": [
+                {
+                    "source": f"binary_sensor.long_context_{source:04d}",
+                    "detail": "available and fresh whole-house context signal",
+                }
+                for source in range(12)
+            ],
+        }
+        for index in range(128)
+    }
+
+    with patch.object(switch, "_behavior_runtime", Mock(diagnostics=behavior)):
+        attributes = switch.extra_state_attributes
+    encoded = json.dumps(attributes, default=str).encode()
+
+    # Keep margin for Home Assistant-added attributes and future small fields.
+    assert len(encoded) < MAX_STATE_ATTRIBUTE_BYTES
+    assert attributes["state_attributes_truncated"] is True
+    assert attributes["configuration_truncated"] is True
+    assert len(attributes["intelligence_decisions"]) <= (
+        MAX_STATE_INTELLIGENCE_DECISIONS
+    )
+    discovery = attributes["intelligence_discovery"]
+    assert len(discovery["entities"]) == MAX_STATE_DIAGNOSTIC_ITEMS
+    assert discovery["truncated"] is True
+    behavior_attributes = attributes["intelligence_behavior"]
+    assert len(behavior_attributes["sample_counts"]) == MAX_STATE_SAMPLE_COUNTS
+    assert behavior_attributes["sample_counts_truncated"] is True
 
 
 async def test_intelligence_active_mode_preserves_baseline_without_permission(hass):

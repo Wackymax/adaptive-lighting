@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from homeassistant.components.adaptive_lighting.behavior_runtime import (
+    MAX_DIAGNOSTIC_DECISIONS,
     MAX_TRACKED_CONTEXTS,
     BehaviorRuntimeAdapter,
     CandidateRecord,
@@ -1369,3 +1370,23 @@ async def test_listener_unload_and_bounded_entity_count(hass) -> None:
     )
     await hass.async_block_till_done()
     assert runtime.diagnostics["accepted_observations"] == 0
+
+
+async def test_recent_decision_diagnostics_keep_latest_window(hass) -> None:
+    """Dashboard counters and explanations describe the bounded recent window."""
+    runtime = await _runtime(hass, [_light()])
+    total = MAX_DIAGNOSTIC_DECISIONS + 5
+    for sequence in range(total):
+        runtime._remember_decision(
+            {
+                "sequence": sequence,
+                "decision": "corrected" if sequence % 2 == 0 else "preview",
+            },
+        )
+
+    diagnostics = runtime.diagnostics
+    recent = list(range(total - MAX_DIAGNOSTIC_DECISIONS, total))
+
+    assert [item["sequence"] for item in diagnostics["last_decisions"]] == recent
+    assert diagnostics["corrections"] == sum(sequence % 2 == 0 for sequence in recent)
+    await runtime.async_stop()
