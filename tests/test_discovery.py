@@ -49,6 +49,8 @@ def _entity(
     device_id: str | None = None,
     device_class: str | None = None,
     capabilities: dict | None = None,
+    name: str | None = None,
+    original_name: str | None = None,
     disabled_by=None,
     hidden_by=None,
 ):
@@ -58,6 +60,7 @@ def _entity(
         unique_id,
         device_id=device_id,
         capabilities=capabilities,
+        original_name=original_name,
         disabled_by=disabled_by,
         hidden_by=hidden_by,
     )
@@ -65,6 +68,8 @@ def _entity(
         entry.entity_id,
         area_id=area_id,
         device_class=device_class,
+        name=name,
+        original_name=original_name,
     )
 
 
@@ -184,6 +189,20 @@ async def test_classification_uses_vendored_ha_capabilities(
     assert {"cover", "opening", "garage_door"}.issubset(
         classify_entity(garage, hass.states.get(garage.entity_id)).capabilities,
     )
+    assert (
+        "light_like_switch"
+        not in classify_entity(
+            garage,
+            hass.states.get(garage.entity_id),
+        ).capabilities
+    )
+    assert (
+        "on_off_light"
+        not in classify_entity(
+            garage,
+            hass.states.get(garage.entity_id),
+        ).capabilities
+    )
     assert {"illuminance", "context"}.issubset(
         classify_entity(
             illuminance,
@@ -234,6 +253,124 @@ async def test_classification_uses_vendored_ha_capabilities(
     assert not discovered_light.discovered_candidate
     assert discovered_light.actionable_capabilities
     assert json.loads(json.dumps(snapshot.to_dict()))["revision"] == 1
+    await coordinator.stop()
+
+
+@pytest.mark.parametrize(
+    ("unique_id", "name", "original_name", "friendly_name", "is_light_like"),
+    [
+        ("dining_room_light", None, None, "Dining Room Light", True),
+        ("dining_room_lamp", None, "Dining Room Lamp", None, True),
+        ("garage_light", "Garage Light", None, None, True),
+        ("guest_bathroom_light", None, None, "Guest Bathroom Light", True),
+        ("office_lamp", "Office Lamp", None, None, True),
+        ("generic_plug", "Generic Plug", None, None, False),
+        ("geyser_light", "Geyser Light", None, None, False),
+        ("garage_door_light", "Garage Door Light", None, None, False),
+        ("pool_pump_light", "Pool Pump Light", None, None, False),
+        ("main_bathroom_light_switch", "Main Bathroom Light Switch", None, None, False),
+        ("detach_relay_light", "Detach Relay Light", None, None, False),
+        ("network_led_light", "Network LED Light", None, None, False),
+        ("turbo_mode_light", "Turbo Mode Light", None, None, False),
+        ("delayed_power_on_light", "Delayed Power-On Light", None, None, False),
+        ("adaptive_sensitivity_light", "Adaptive Sensitivity Light", None, None, False),
+        ("detection_range_light", "Detection Range Light", None, None, False),
+    ],
+)
+def test_switch_classification_is_conservative(
+    hass,
+    entity_registry,
+    unique_id,
+    name,
+    original_name,
+    friendly_name,
+    is_light_like,
+):
+    """Use light-like switch labels only for strong load metadata matches."""
+    entry = _entity(
+        entity_registry,
+        "switch",
+        unique_id,
+        name=name,
+        original_name=original_name,
+    )
+    attributes = {"friendly_name": friendly_name} if friendly_name else {}
+    hass.states.async_set(entry.entity_id, "off", attributes)
+
+    classification = classify_entity(entry, hass.states.get(entry.entity_id))
+    expected = (
+        ("switch", "light_like_switch", "on_off_light")
+        if is_light_like
+        else ("switch",)
+    )
+    assert classification.capabilities == expected
+    assert not classification.dimmable
+
+
+async def test_include_all_areas_reconciles_area_registry_changes(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Opt-in whole-house discovery follows area and entity registry changes."""
+    living = area_registry.async_create("Living")
+    dining_light = _entity(
+        entity_registry,
+        "switch",
+        "dining_room_light",
+        area_id=living.id,
+    )
+    hass.states.async_set(dining_light.entity_id, "off")
+
+    coordinator = EntityDiscoveryCoordinator(
+        hass,
+        seed_entity_ids=[dining_light.entity_id],
+        include_all_areas=True,
+        debounce_seconds=0,
+    )
+    initial = await coordinator.start()
+    assert initial.monitored_area_ids == (living.id,)
+    assert dining_light.entity_id in initial.entity_ids
+
+    office = area_registry.async_create("Office")
+    office_lamp = _entity(
+        entity_registry,
+        "switch",
+        "office_lamp",
+        area_id=office.id,
+    )
+    hass.states.async_set(office_lamp.entity_id, "off")
+    await hass.async_block_till_done()
+    assert coordinator.snapshot.monitored_area_ids == tuple(
+        sorted((living.id, office.id)),
+    )
+    assert office_lamp.entity_id in coordinator.snapshot.entity_ids
+
+    area_registry.async_update(office.id, name="Study")
+    await hass.async_block_till_done()
+    study_lamp = next(
+        item
+        for item in coordinator.snapshot.entities
+        if item.entity_id == office_lamp.entity_id
+    )
+    assert study_lamp.area_name == "Study"
+
+    entity_registry.async_update_entity(office_lamp.entity_id, area_id=living.id)
+    await hass.async_block_till_done()
+    assert coordinator.snapshot.moved[-1].entity_id == office_lamp.entity_id
+    assert coordinator.snapshot.moved[-1].new_area_id == living.id
+
+    area_registry.async_delete(office.id)
+    await hass.async_block_till_done()
+    assert coordinator.snapshot.monitored_area_ids == (living.id,)
+    assert office_lamp.entity_id in coordinator.snapshot.entity_ids
+
+    entity_registry.async_remove(dining_light.entity_id)
+    await hass.async_block_till_done()
+    assert dining_light.entity_id not in coordinator.snapshot.entity_ids
+    assert dining_light.entity_id in {
+        item.entity_id for item in coordinator.snapshot.removed
+    }
     await coordinator.stop()
 
 

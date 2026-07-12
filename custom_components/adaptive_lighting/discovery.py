@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, fields
 from typing import Any
@@ -72,6 +73,60 @@ _CONTEXT_CAPABILITIES = frozenset(
     },
 )
 
+# Switches do not expose the native light-domain contract, so only a narrow
+# metadata match is enough to label one as light-like.  These labels describe
+# inventory semantics only; a separate actuation gate must still approve any
+# service call against the entity.
+_LIGHT_LIKE_SWITCH_TERMS = frozenset({"light", "lamp", "lighting"})
+_NON_LIGHT_SWITCH_TERMS = frozenset(
+    {
+        "charger",
+        "coffee",
+        "compressor",
+        "cover",
+        "dishwasher",
+        "door",
+        "dryer",
+        "fan",
+        "freezer",
+        "fridge",
+        "heater",
+        "hob",
+        "inverter",
+        "kettle",
+        "machine",
+        "microwave",
+        "motor",
+        "oven",
+        "outlet",
+        "plug",
+        "pool",
+        "pump",
+        "relay",
+        "socket",
+        "stove",
+        "washer",
+        "washing",
+        "water",
+    },
+)
+_NON_LIGHT_SWITCH_PHRASES = (
+    "garage door",
+    "garage cover",
+    "garage opener",
+    "garage motor",
+    "geyser",
+)
+_SWITCH_ACCESSORY_PHRASES = (
+    "adaptive sensitivity",
+    "delayed power on",
+    "detach relay",
+    "detached relay",
+    "detection range",
+    "network led",
+    "turbo mode",
+)
+
 
 def _value(value: Any) -> str | None:
     """Return a stable string for a HA enum or string value."""
@@ -91,6 +146,62 @@ def _normalise_ids(entity_ids: Iterable[str]) -> tuple[str, ...]:
 def _deduplicate(values: Iterable[str]) -> tuple[str, ...]:
     """Deduplicate capability names without changing their semantic order."""
     return tuple(dict.fromkeys(values))
+
+
+def _normalise_metadata(value: Any) -> str:
+    """Return comparable words from a registry or live metadata value."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+
+
+def _switch_metadata(
+    entry: entity_registry.RegistryEntry,
+    state: State | None,
+) -> tuple[str, ...]:
+    """Collect the names that can identify a switch's controlled load."""
+    values = (
+        entry.entity_id,
+        entry.name,
+        entry.original_name,
+        entry.original_name_unprefixed,
+        state.attributes.get(ATTR_FRIENDLY_NAME) if state is not None else None,
+    )
+    return tuple(_normalise_metadata(value) for value in values if value)
+
+
+def _is_light_like_switch(
+    entry: entity_registry.RegistryEntry,
+    state: State | None,
+) -> bool:
+    """Return whether metadata narrowly identifies a switch-controlled light."""
+    metadata = _switch_metadata(entry, state)
+    words = {word for value in metadata for word in value.split()}
+
+    # HA integrations often expose accessory/configuration switches alongside
+    # the actual load.  A ``*_light_switch`` entity is likewise commonly a
+    # detached wall-input or secondary control, not the light itself.
+    if any(
+        any(
+            value == phrase or value.endswith(f" {phrase}")
+            for phrase in ("light switch",)
+        )
+        for value in metadata
+    ):
+        return False
+    if any(
+        phrase in value for value in metadata for phrase in _SWITCH_ACCESSORY_PHRASES
+    ):
+        return False
+
+    # Exclusions win over a coincidental ``light`` token.  ``garage`` alone is
+    # intentionally not excluded: a specifically named ``garage_light`` is a
+    # useful light candidate, while garage door/cover loads remain excluded.
+    if words & _NON_LIGHT_SWITCH_TERMS:
+        return False
+    if any(
+        phrase in value for value in metadata for phrase in _NON_LIGHT_SWITCH_PHRASES
+    ):
+        return False
+    return bool(words & _LIGHT_LIKE_SWITCH_TERMS)
 
 
 def _supported_color_modes(
@@ -133,10 +244,12 @@ def classify_entity(  # noqa: PLR0912,PLR0915 - one auditable branch per HA doma
 ) -> EntityClassification:
     """Classify an entity using registry metadata and, when present, live state.
 
-    The domain remains authoritative for whether something is a light.  In
-    particular, a switch that happens to drive a lamp is not promoted to a
-    controllable light.  Light dimmability comes from the HA supported color
-    mode contract, with the registry capabilities used when state is absent.
+    Native ``light`` entities remain authoritative for light capabilities and
+    dimmability.  A narrowly named switch may receive light-like inventory
+    labels, but that heuristic does not authorize actuation; a separate gate
+    must approve any control path.  Native light dimmability comes from the HA
+    supported color mode contract, with registry capabilities used when state
+    is absent.
     """
     domain = entry.domain
     device_class = _value(
@@ -237,6 +350,10 @@ def classify_entity(  # noqa: PLR0912,PLR0915 - one auditable branch per HA doma
         capabilities.extend(("sun", "daylight_proxy", "context"))
     elif domain == PERSON_DOMAIN:
         capabilities.extend(("person", "household_presence", "context"))
+    elif domain == "switch":
+        capabilities.append("switch")
+        if _is_light_like_switch(entry, state):
+            capabilities.extend(("light_like_switch", "on_off_light"))
     else:
         capabilities.append(
             domain if domain in {"switch", "fan", "climate"} else "other",
@@ -452,10 +569,15 @@ class EntityDiscoveryCoordinator:
         light_entity_ids: Iterable[str] = (),
         context_entity_ids: Iterable[str] = (),
         explicit_controlled_entity_ids: Iterable[str] = (),
+        include_all_areas: bool = False,
         debounce_seconds: float = 0.05,
         on_change: ChangeCallback | None = None,
     ) -> None:
-        """Create a coordinator with explicit seed and control boundaries."""
+        """Create a coordinator with explicit seed and control boundaries.
+
+        ``include_all_areas`` is an explicit whole-house inventory opt-in; it
+        does not widen the separate actuation boundary.
+        """
         self.hass = hass
         self.seed_entity_ids = _normalise_ids(
             (*seed_entity_ids, *light_entity_ids, *context_entity_ids),
@@ -463,6 +585,7 @@ class EntityDiscoveryCoordinator:
         self.explicit_controlled_entity_ids = frozenset(
             _normalise_ids(explicit_controlled_entity_ids),
         )
+        self.include_all_areas = include_all_areas
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self._on_change = on_change
         self._entity_registry = entity_registry.async_get(hass)
@@ -708,7 +831,9 @@ class EntityDiscoveryCoordinator:
         return self._device_registry.async_get(entry.device_id)
 
     def _derive_monitored_area_ids(self) -> set[str]:
-        """Derive areas only from explicit configured seed entities."""
+        """Derive areas from all registry areas or explicit seeds."""
+        if self.include_all_areas:
+            return {area.id for area in self._area_registry.async_list_areas()}
         area_ids: set[str] = set()
         for entity_id in self.seed_entity_ids:
             entry = self._entity_registry.async_get(entity_id)
@@ -769,7 +894,8 @@ class EntityDiscoveryCoordinator:
                     device_class=_value(entry.device_class),
                     capabilities=capabilities,
                     # Availability gates what a future executor may consume;
-                    # discovery itself never turns this into authority.
+                    # these heuristic labels are still inventory metadata and
+                    # a separate actuation gate is required for service calls.
                     actionable_capabilities=capabilities if available else (),
                     supported_color_modes=classification.supported_color_modes,
                     status=status,
