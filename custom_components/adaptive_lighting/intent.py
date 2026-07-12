@@ -103,6 +103,22 @@ _SIGNAL_NAMES: dict[Intent, tuple[str, ...]] = {
     Intent.VACANT: ("vacant",),
 }
 
+# Semantic aliases are deliberately narrow.  In particular, ``away`` is not
+# proof that a room is vacant, and ``prelight`` is not proof of a night path.
+# Those ambiguous labels may inform a future predictor but must not authorize
+# current-room actuation in this policy.
+_INTENT_HINTS: dict[Intent, frozenset[str]] = {
+    Intent.EMERGENCY: frozenset({"emergency", "alarm"}),
+    Intent.MANUAL: frozenset({"manual"}),
+    Intent.SLEEP: frozenset({"sleep"}),
+    Intent.NIGHT_PATH: frozenset({"night", "night_path"}),
+    Intent.TASK: frozenset({"task", "focus", "work"}),
+    Intent.VIDEO: frozenset({"video", "movie", "cinema"}),
+    Intent.ARRIVAL: frozenset({"arrival", "welcome"}),
+    Intent.AMBIENT: frozenset({"ambient", "relax", "chill"}),
+    Intent.VACANT: frozenset({"vacant"}),
+}
+
 
 def _provenance(name: str, value: ContextSignal[object]) -> InputProvenance:
     return InputProvenance(
@@ -141,23 +157,12 @@ def _candidate(
         # Semantic inputs are advisory labels, but when they explicitly name
         # an intent they are still stronger evidence than the ambient fallback.
         # They never create an intent for unrelated words such as "adaptive".
-        hint_values = {
-            "emergency": {"emergency", "alarm"},
-            "manual": {"manual", "hold"},
-            "sleep": {"sleep"},
-            "night_path": {"night", "night_path", "path", "prelight"},
-            "task": {"task", "focus", "work"},
-            "video": {"video", "movie", "cinema"},
-            "arrival": {"arrival", "welcome"},
-            "ambient": {"ambient", "relax", "chill"},
-            "vacant": {"vacant", "away"},
-        }
         for name in ("intent_hint", "semantic_intent"):
             value = getattr(snapshot, name)
             if (
                 value.usable()
                 and isinstance(value.value, str)
-                and value.value.strip().lower() in hint_values[intent.value]
+                and value.value in _INTENT_HINTS[intent]
             ):
                 selected = (name, value)
                 break
@@ -183,30 +188,7 @@ def _candidate(
     name, value = selected
     active = value.value is True or (
         isinstance(value.value, str)
-        and value.value.strip().lower() in {
-            "emergency",
-            "alarm",
-            "manual",
-            "hold",
-            "sleep",
-            "night",
-            "night_path",
-            "path",
-            "prelight",
-            "task",
-            "focus",
-            "work",
-            "video",
-            "movie",
-            "cinema",
-            "arrival",
-            "welcome",
-            "ambient",
-            "relax",
-            "chill",
-            "vacant",
-            "away",
-        }
+        and value.value in _INTENT_HINTS[intent]
     )
     if intent is Intent.VACANT and name == "occupancy":
         active = value.value is False

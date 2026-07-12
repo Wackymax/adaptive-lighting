@@ -11,6 +11,40 @@ from typing import Generic, TypeVar
 
 T = TypeVar("T")
 
+_BOOLEAN_SIGNAL_FIELDS = frozenset(
+    {
+        "emergency",
+        "manual",
+        "manual_hold",
+        "sleep",
+        "sleep_mode",
+        "night_path",
+        "night_path_active",
+        "task",
+        "task_mode",
+        "video",
+        "video_playing",
+        "arrival",
+        "arrival_active",
+        "ambient",
+        "vacant",
+        "occupancy",
+        "motion",
+        "companion_on",
+        "media_playing",
+    },
+)
+_NUMERIC_SIGNAL_FIELDS = frozenset(
+    {
+        "daylight",
+        "illuminance",
+        "ambient_brightness",
+        "requested_brightness",
+        "current_brightness",
+    },
+)
+_TEXT_SIGNAL_FIELDS = frozenset({"semantic_intent", "intent_hint"})
+
 
 @dataclass(frozen=True, slots=True)
 class ContextSignal(Generic[T]):
@@ -29,19 +63,59 @@ class ContextSignal(Generic[T]):
     age_seconds: float | None = None
     max_age_seconds: float | None = None
     detail: str = ""
+    _freshness_valid: bool = field(init=False, default=True, repr=False)
 
     def __post_init__(self) -> None:
         """Normalize quality numbers so callers cannot create unsafe metadata."""
         confidence = self.confidence
-        if not isfinite(confidence):
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not isfinite(confidence)
+        ):
             confidence = 0.0
-        object.__setattr__(self, "confidence", min(1.0, max(0.0, confidence)))
+        object.__setattr__(self, "confidence", min(1.0, max(0.0, float(confidence))))
 
-        for name in ("age_seconds", "max_age_seconds"):
-            value = getattr(self, name)
-            if value is not None:
-                value = None if not isfinite(value) else max(0.0, value)
-                object.__setattr__(self, name, value)
+        invalid_freshness = False
+        age_seconds = self.age_seconds
+        if age_seconds is not None:
+            if (
+                isinstance(age_seconds, bool)
+                or not isinstance(age_seconds, (int, float))
+                or not isfinite(age_seconds)
+                or age_seconds < 0
+            ):
+                invalid_freshness = True
+                age_seconds = None
+            else:
+                age_seconds = float(age_seconds)
+            object.__setattr__(self, "age_seconds", age_seconds)
+
+        max_age_seconds = self.max_age_seconds
+        if max_age_seconds is not None:
+            if (
+                isinstance(max_age_seconds, bool)
+                or not isinstance(max_age_seconds, (int, float))
+                or not isfinite(max_age_seconds)
+                or max_age_seconds < 0
+            ):
+                # ``None`` means "no freshness limit", so coercing a malformed
+                # configured limit to ``None`` would fail open.  Retain a finite
+                # zero limit and mark the signal unusable instead.
+                invalid_freshness = True
+                max_age_seconds = 0.0
+                object.__setattr__(self, "age_seconds", None)
+            else:
+                max_age_seconds = float(max_age_seconds)
+            object.__setattr__(self, "max_age_seconds", max_age_seconds)
+
+        if invalid_freshness:
+            object.__setattr__(self, "_freshness_valid", False)
+            object.__setattr__(self, "available", False)
+            object.__setattr__(self, "confidence", 0.0)
+            detail = self.detail.strip()
+            suffix = "invalid freshness metadata"
+            object.__setattr__(self, "detail", f"{detail}; {suffix}" if detail else suffix)
 
         # A signal with no value, or with an explicitly false availability bit,
         # is missing.  Normalizing confidence to zero prevents accidental use
@@ -56,9 +130,12 @@ class ContextSignal(Generic[T]):
     @property
     def fresh(self) -> bool:
         """Whether this signal is within its optional freshness limit."""
-        return self.max_age_seconds is None or (
-            self.age_seconds is not None
-            and self.age_seconds <= self.max_age_seconds
+        return self._freshness_valid and (
+            self.max_age_seconds is None
+            or (
+                self.age_seconds is not None
+                and self.age_seconds <= self.max_age_seconds
+            )
         )
 
     def usable(self) -> bool:
@@ -153,6 +230,60 @@ class ContextSnapshot:
     semantic_intent: ContextSignal[str] = field(default_factory=unavailable)
     intent_hint: ContextSignal[str] = field(default_factory=unavailable)
 
+    @staticmethod
+    def _invalid_signal(value: ContextSignal[object], expected: str) -> ContextSignal[object]:
+        """Reject an ambiguous adapter value while retaining its provenance."""
+        detail = value.detail.strip()
+        suffix = f"invalid {expected} value"
+        return ContextSignal(
+            value=None,
+            source=value.source,
+            available=False,
+            confidence=0.0,
+            age_seconds=value.age_seconds,
+            max_age_seconds=value.max_age_seconds,
+            detail=f"{detail}; {suffix}" if detail else suffix,
+        )
+
+    @classmethod
+    def _normalize_field(
+        cls,
+        name: str,
+        value: ContextSignal[object],
+    ) -> ContextSignal[object]:
+        """Normalize only unambiguous scalar forms accepted at the pure seam."""
+        raw = value.value
+        if not value.available or raw is None:
+            return value
+
+        if name in _BOOLEAN_SIGNAL_FIELDS:
+            if isinstance(raw, bool):
+                normalized = raw
+            elif isinstance(raw, str) and raw.strip().lower() in {"on", "off"}:
+                normalized = raw.strip().lower() == "on"
+            else:
+                return cls._invalid_signal(value, "boolean")
+        elif name in _NUMERIC_SIGNAL_FIELDS:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not isfinite(raw):
+                return cls._invalid_signal(value, "numeric")
+            normalized = float(raw)
+        elif name in _TEXT_SIGNAL_FIELDS:
+            if not isinstance(raw, str) or not raw.strip():
+                return cls._invalid_signal(value, "text")
+            normalized = raw.strip().lower()
+        else:  # pragma: no cover - declaration and validation sets move together.
+            return cls._invalid_signal(value, "context")
+
+        return ContextSignal(
+            value=normalized,
+            source=value.source,
+            available=value.available,
+            confidence=value.confidence,
+            age_seconds=value.age_seconds,
+            max_age_seconds=value.max_age_seconds,
+            detail=value.detail,
+        )
+
     def __post_init__(self) -> None:
         """Normalize simple adapter values into typed, immutable signals.
 
@@ -164,13 +295,14 @@ class ContextSnapshot:
         """
         for item in fields(self):
             value = getattr(self, item.name)
-            if isinstance(value, ContextSignal):
-                continue
-            normalized = (
-                unavailable(source="adapter")
+            wrapped = (
+                value
+                if isinstance(value, ContextSignal)
+                else unavailable(source="adapter")
                 if value is None
                 else signal(value, source="adapter")
             )
+            normalized = self._normalize_field(item.name, wrapped)
             object.__setattr__(self, item.name, normalized)
 
     def signals(self) -> tuple[tuple[str, ContextSignal[object]], ...]:

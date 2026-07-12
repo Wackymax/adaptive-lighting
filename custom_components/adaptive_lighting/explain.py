@@ -17,6 +17,9 @@ class DecisionExplanation:
     reasons: tuple[str, ...]
     rejected_alternatives: tuple[RejectedAlternative, ...]
     input_provenance: tuple[InputProvenance, ...]
+    can_adjust: bool
+    can_turn_on: bool
+    can_turn_off: bool
 
     @property
     def active_intent(self) -> Intent:
@@ -32,6 +35,8 @@ class DecisionExplanation:
         return (
             f"{self.summary} Reasons: {reasons}. "
             f"Rejected alternatives: {rejected}. "
+            f"Permissions: adjust={self.can_adjust}, turn_on={self.can_turn_on}, "
+            f"turn_off={self.can_turn_off}. "
             f"Confidence: {self.confidence:.2f}."
         )
 
@@ -46,16 +51,22 @@ def explain_decision(decision: PolicyDecision) -> DecisionExplanation:
     companion = (
         "hold" if decision.companion_on is None else "on" if decision.companion_on else "off"
     )
+    actionable = decision.can_adjust or decision.can_turn_on or decision.can_turn_off
+    summary = (
+        f"Use {decision.intent.value} lighting at {target}; companion recommendation is {companion}"
+        if actionable
+        else f"Preview {decision.intent.value} lighting at {target}; no automatic action is authorized"
+    )
     return DecisionExplanation(
-        summary=(
-            f"Use {decision.intent.value} lighting at {target}; "
-            f"companion recommendation is {companion}"
-        ),
+        summary=summary,
         intent=decision.intent,
         confidence=decision.confidence,
         reasons=decision.reasons,
         rejected_alternatives=decision.rejected_alternatives,
         input_provenance=decision.input_provenance,
+        can_adjust=decision.can_adjust,
+        can_turn_on=decision.can_turn_on,
+        can_turn_off=decision.can_turn_off,
     )
 
 

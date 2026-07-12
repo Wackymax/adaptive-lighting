@@ -20,6 +20,7 @@ if _PACKAGE not in sys.modules:
     sys.modules[_PACKAGE] = package
 
 from custom_components.adaptive_lighting.context import (
+    ContextSignal,
     ContextSnapshot,
     signal,
     unavailable,
@@ -51,6 +52,9 @@ def test_priority_emergency_beats_every_other_intent() -> None:
     assert decision.priority > decision.rejected_alternatives[0].priority
     assert any(item.intent is Intent.MANUAL for item in decision.rejected_alternatives)
     assert decision.companion_on is True
+    assert decision.can_adjust is True
+    assert decision.can_turn_on is True
+    assert decision.can_turn_off is False
 
 
 @pytest.mark.parametrize(
@@ -82,18 +86,30 @@ def test_manual_control_is_never_fought() -> None:
     assert decision.intent is Intent.MANUAL
     assert decision.brightness_target == 72
     assert decision.companion_on is None
+    assert decision.can_adjust is False
+    assert decision.can_turn_on is False
+    assert decision.can_turn_off is False
     assert decision.should_apply is False
-    assert "will not fight" in decision.reasons[-1]
+    assert any("will not fight" in reason for reason in decision.reasons)
 
 
 def test_unavailable_inputs_degrade_without_turning_companion_on_or_off() -> None:
     decision = decide(ContextSnapshot())
+    explanation = explain_decision(decision)
 
     assert decision.intent is Intent.AMBIENT
     assert decision.brightness_target == 30
     assert decision.companion_on is None
     assert decision.confidence == 0.25
+    assert decision.can_adjust is False
+    assert decision.can_turn_on is False
+    assert decision.can_turn_off is False
+    assert decision.should_apply is False
     assert all(item.available is False for item in decision.input_provenance)
+    assert explanation.can_adjust is False
+    assert explanation.can_turn_on is False
+    assert explanation.can_turn_off is False
+    assert "no automatic action is authorized" in explanation.summary
 
 
 def test_known_vacancy_can_turn_companion_off_but_missing_occupancy_cannot() -> None:
@@ -102,7 +118,102 @@ def test_known_vacancy_can_turn_companion_off_but_missing_occupancy_cannot() -> 
 
     assert vacant.intent is Intent.VACANT
     assert vacant.companion_on is False
+    assert vacant.can_adjust is False
+    assert vacant.can_turn_on is False
+    assert vacant.can_turn_off is True
+    assert vacant.should_apply is True
     assert unknown.companion_on is None
+    assert unknown.can_turn_off is False
+
+
+def test_ambient_permissions_separate_adjustment_from_turn_on() -> None:
+    unknown_occupancy = decide(ContextSnapshot(ambient=active(source="scene")))
+    confirmed_occupancy = decide(
+        ContextSnapshot(
+            ambient=active(source="scene"),
+            occupancy=active(source="presence"),
+        ),
+    )
+    low_confidence = decide(
+        ContextSnapshot(
+            ambient=signal(True, source="weak-scene", confidence=0.2),
+            occupancy=active(source="presence"),
+        ),
+    )
+
+    assert unknown_occupancy.can_adjust is True
+    assert unknown_occupancy.can_turn_on is False
+    assert unknown_occupancy.companion_on is None
+    assert confirmed_occupancy.can_adjust is True
+    assert confirmed_occupancy.can_turn_on is True
+    assert confirmed_occupancy.companion_on is True
+    assert low_confidence.can_adjust is False
+    assert low_confidence.can_turn_on is False
+    assert low_confidence.should_apply is False
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("on", True), ("off", False)])
+def test_raw_ha_boolean_strings_are_normalized(raw: str, expected: bool) -> None:
+    direct = ContextSnapshot(occupancy=raw)  # type: ignore[arg-type]
+    wrapped = ContextSnapshot(occupancy=signal(raw, source="ha-state"))
+
+    assert direct.occupancy.value is expected
+    assert wrapped.occupancy.value is expected
+    assert direct.occupancy.usable() is True
+    assert wrapped.occupancy.usable() is True
+    if expected:
+        task = decide(ContextSnapshot(task=raw))  # type: ignore[arg-type]
+        assert task.intent is Intent.TASK
+        assert task.can_turn_on is True
+    else:
+        vacancy = decide(direct)
+        assert vacancy.intent is Intent.VACANT
+        assert vacancy.can_turn_off is True
+
+
+def test_ambiguous_boolean_string_is_rejected_and_cannot_act() -> None:
+    snapshot = ContextSnapshot(
+        occupancy="unknown",  # type: ignore[arg-type]
+        ambient="unknown",  # type: ignore[arg-type]
+    )
+    decision = decide(snapshot)
+
+    assert snapshot.occupancy.usable() is False
+    assert snapshot.ambient.usable() is False
+    assert "invalid boolean value" in snapshot.occupancy.detail
+    assert decision.can_adjust is False
+    assert decision.can_turn_on is False
+    assert decision.can_turn_off is False
+
+
+@pytest.mark.parametrize("max_age", [float("inf"), float("nan"), -1.0, "invalid"])
+def test_invalid_max_age_fails_closed(max_age: object) -> None:
+    value = ContextSignal(
+        value=True,
+        source="sensor",
+        age_seconds=0,
+        max_age_seconds=max_age,  # type: ignore[arg-type]
+    )
+
+    assert value.max_age_seconds is not None
+    assert value.fresh is False
+    assert value.usable() is False
+    assert value.available is False
+    assert "invalid freshness metadata" in value.detail
+
+
+def test_ambiguous_semantic_aliases_do_not_authorize_actions() -> None:
+    away = decide(ContextSnapshot(semantic_intent="away"))  # type: ignore[arg-type]
+    prelight = decide(ContextSnapshot(intent_hint="prelight"))  # type: ignore[arg-type]
+    night = decide(ContextSnapshot(intent_hint="night"))  # type: ignore[arg-type]
+
+    assert away.intent is Intent.AMBIENT
+    assert away.should_apply is False
+    assert prelight.intent is Intent.AMBIENT
+    assert prelight.should_apply is False
+    assert night.intent is Intent.NIGHT_PATH
+    assert night.can_adjust is True
+    assert night.can_turn_on is True
 
 
 def test_sleep_and_night_path_targets_never_exceed_caps() -> None:

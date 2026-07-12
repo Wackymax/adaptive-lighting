@@ -19,6 +19,22 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
     return min(upper, max(lower, value))
 
 
+def _normalized_percentage(value: object, *, invalid: float = 0.0) -> float:
+    """Return a finite percentage, using the fail-closed invalid value."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+    ):
+        return invalid
+    return _clamp(float(value))
+
+
+def _normalized_optional_percentage(value: object) -> float | None:
+    """Normalize an optional cap without duplicating safety branches."""
+    return None if value is None else _normalized_percentage(value)
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyConfig:
     """User-tunable targets and hard safety caps, expressed as percentages."""
@@ -46,6 +62,7 @@ class PolicyConfig:
     video_brightness_cap: float | None = None
     night_brightness_cap: float | None = None
     prelight_brightness_cap: float | None = None
+    minimum_action_confidence: float = 0.5
 
     def __post_init__(self) -> None:
         """Normalize configuration once, keeping every later decision pure."""
@@ -64,10 +81,7 @@ class PolicyConfig:
             "night_path_max_brightness",
         )
         for name in percentage_fields:
-            value = getattr(self, name)
-            if not isfinite(value):
-                value = 0.0
-            object.__setattr__(self, name, _clamp(value))
+            object.__setattr__(self, name, _normalized_percentage(getattr(self, name)))
 
         # A reversed general range is repaired conservatively to the lower
         # endpoint.  This avoids an exception in a safety path and guarantees a
@@ -79,11 +93,8 @@ class PolicyConfig:
             ("sleep_cap", "sleep_max_brightness"),
             ("night_path_cap", "night_path_max_brightness"),
         ):
-            cap = getattr(self, name)
+            cap = _normalized_optional_percentage(getattr(self, name))
             if cap is not None:
-                if not isfinite(cap):
-                    cap = 0.0
-                cap = _clamp(cap)
                 object.__setattr__(self, name, cap)
                 object.__setattr__(self, cap_name, min(getattr(self, cap_name), cap))
 
@@ -94,11 +105,9 @@ class PolicyConfig:
             "night_brightness_cap",
             "prelight_brightness_cap",
         ):
-            cap = getattr(self, name)
+            cap = _normalized_optional_percentage(getattr(self, name))
             if cap is not None:
-                if not isfinite(cap):
-                    cap = 0.0
-                object.__setattr__(self, name, _clamp(cap))
+                object.__setattr__(self, name, cap)
 
         for target_name, cap_name in (
             ("task_brightness", "task_brightness_cap"),
@@ -115,6 +124,17 @@ class PolicyConfig:
                 min(self.night_path_max_brightness, self.night_brightness_cap),
             )
 
+        confidence = self.minimum_action_confidence
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not isfinite(confidence)
+        ):
+            # Invalid safety configuration must require maximum confidence,
+            # never silently lower the threshold.
+            confidence = 1.0
+        object.__setattr__(self, "minimum_action_confidence", _clamp(float(confidence), 0.0, 1.0))
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyDecision:
@@ -128,6 +148,9 @@ class PolicyDecision:
     reasons: tuple[str, ...]
     rejected_alternatives: tuple[RejectedAlternative, ...]
     input_provenance: tuple[InputProvenance, ...]
+    can_adjust: bool
+    can_turn_on: bool
+    can_turn_off: bool
     should_apply: bool
 
     @property
@@ -273,8 +296,10 @@ def _companion_for(
             recommendation = True
             reason = "occupancy is available and confirms the ambient light may be on"
         else:
-            recommendation = False
-            reason = "occupancy is available and confirms the room is vacant"
+            # If explicit ambient intent beat the lower-priority vacancy
+            # candidate, neither turn-on nor turn-off is authorized here.
+            recommendation = None
+            reason = "ambient intent is active but occupancy is false; preserving companion state"
     else:
         recommendation = None
         reason = "occupancy is unavailable; preserving the companion state is safer"
@@ -294,6 +319,69 @@ def _confidence(
     return _clamp(confidence, 0.0, 1.0)
 
 
+def _action_permissions(
+    resolution: IntentResolution,
+    snapshot: ContextSnapshot,
+    config: PolicyConfig,
+    target: float | None,
+) -> tuple[bool, bool, bool, str]:
+    """Return explicit adjustment, turn-on, and turn-off authorization.
+
+    A brightness target is always a preview value first.  ``can_adjust`` only
+    authorizes changing a light that is already on; it never implies permission
+    to turn that light on.  Keeping those permissions separate closes the
+    common service-call trap where setting brightness also powers on a light.
+    """
+    intent = resolution.intent
+    can_adjust: bool
+    can_turn_on: bool
+    can_turn_off: bool
+    reason: str
+    if intent is Intent.MANUAL:
+        can_adjust, can_turn_on, can_turn_off = False, False, False
+        reason = "manual intent blocks every automatic action"
+    elif intent is Intent.EMERGENCY:
+        can_adjust, can_turn_on, can_turn_off = target is not None, True, False
+        reason = "emergency authorizes adjustment and turn-on"
+    elif intent is Intent.VACANT:
+        confident = resolution.confidence >= config.minimum_action_confidence
+        if confident:
+            can_adjust, can_turn_on, can_turn_off = False, False, True
+            reason = "confirmed vacancy authorizes turn-off only"
+        else:
+            can_adjust, can_turn_on, can_turn_off = False, False, False
+            reason = "vacancy confidence is below the action threshold"
+    elif resolution.confidence < config.minimum_action_confidence:
+        can_adjust, can_turn_on, can_turn_off = False, False, False
+        reason = "intent confidence is below the action threshold"
+    elif intent is Intent.AMBIENT:
+        ambient_candidate = next(
+            candidate
+            for candidate in resolution.candidates
+            if candidate.intent is Intent.AMBIENT
+        )
+        can_adjust = target is not None and ambient_candidate.available
+        occupancy = snapshot.occupancy
+        can_turn_on = (
+            can_adjust
+            and occupancy.usable()
+            and occupancy.value is True
+            and occupancy.confidence >= config.minimum_action_confidence
+        )
+        reason = (
+            "ambient may adjust an already-on light and confirmed occupancy permits turn-on"
+            if can_turn_on
+            else "ambient may adjust an already-on light but does not permit turn-on"
+            if can_adjust
+            else "ambient fallback is preview-only"
+        )
+        can_turn_off = False
+    else:
+        can_adjust, can_turn_on, can_turn_off = target is not None, True, False
+        reason = f"explicit {intent.value} authorizes adjustment and turn-on"
+    return can_adjust, can_turn_on, can_turn_off, reason
+
+
 def evaluate_policy(
     snapshot: ContextSnapshot,
     config: PolicyConfig | None = None,
@@ -304,14 +392,32 @@ def evaluate_policy(
     target, target_reason = _target_for(resolution.intent, snapshot, config)
     companion_on, companion_reason = _companion_for(resolution.intent, snapshot)
     confidence = _confidence(resolution, snapshot, resolution.intent)
+    can_adjust, can_turn_on, can_turn_off, permission_reason = _action_permissions(
+        resolution,
+        snapshot,
+        config,
+        target,
+    )
+
+    # Recommendations must never suggest an action that the explicit permission
+    # contract forbids.  ``None`` means preserve the current companion state.
+    if companion_on is True and not can_turn_on:
+        companion_on = None
+        companion_reason = f"{companion_reason}; turn-on permission withheld"
+    elif companion_on is False and not can_turn_off:
+        companion_on = None
+        companion_reason = f"{companion_reason}; turn-off permission withheld"
 
     reasons = (
         f"selected {resolution.intent.value} intent at priority {resolution.priority}",
         resolution.reason,
         target_reason,
         companion_reason,
+        permission_reason,
     )
-    should_apply = resolution.intent is not Intent.MANUAL and target is not None
+    # Compatibility summary only.  Executors must use the action-specific flags
+    # because this value does not distinguish adjustment from a power action.
+    should_apply = can_adjust or can_turn_on or can_turn_off
 
     return PolicyDecision(
         intent=resolution.intent,
@@ -322,6 +428,9 @@ def evaluate_policy(
         reasons=reasons,
         rejected_alternatives=resolution.rejected_alternatives,
         input_provenance=snapshot.input_provenance,
+        can_adjust=can_adjust,
+        can_turn_on=can_turn_on,
+        can_turn_off=can_turn_off,
         should_apply=should_apply,
     )
 
