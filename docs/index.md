@@ -23,7 +23,7 @@ icon: lucide/sun
 
 By automatically adapting the settings of your lights throughout the day, Adaptive Lighting provides a predictable daylight-aligned curve. It is a lighting control component, not a medical, circadian, or melanopic measurement system.
 
-For the fork's implementation boundary and rollout rules, read the [context-aware intelligence architecture](intelligence-architecture.md). For maintenance and upstream sync, see [fork ownership](fork-maintenance.md).
+For the fork's implementation boundary and safety rules, read the [context-aware intelligence architecture](intelligence-architecture.md). The live commissioning sequence is documented in the [Toothless intelligence rollout](toothless-intelligence-rollout.md). For maintenance and upstream sync, see [fork ownership](fork-maintenance.md).
 
 ## Features
 

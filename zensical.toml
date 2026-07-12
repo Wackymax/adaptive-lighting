@@ -8,14 +8,16 @@ site_author = "Bas Nijholt"
 site_url = "https://adaptive-lighting.nijho.lt/"
 copyright = "Copyright &copy; 2020-2026 Bas Nijholt"
 
-repo_url = "https://github.com/basnijholt/adaptive-lighting"
-repo_name = "GitHub"
+repo_url = "https://github.com/Wackymax/adaptive-lighting"
+repo_name = "Wackymax/adaptive-lighting"
 edit_uri = "edit/main/docs"
 
 nav = [
   { "Home" = "index.md" },
   { "Getting Started" = "getting-started.md" },
   { "Configuration" = "configuration.md" },
+  { "Intelligence Architecture" = "intelligence-architecture.md" },
+  { "Toothless Rollout" = "toothless-intelligence-rollout.md" },
   { "Services" = "services.md" },
   { "Automation Examples" = "automation-examples.md" },
   { "Troubleshooting" = "troubleshooting.md" },
@@ -89,7 +91,7 @@ provider = "custom"
 
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
-link = "https://github.com/basnijholt/adaptive-lighting"
+link = "https://github.com/Wackymax/adaptive-lighting"
 
 [[project.extra.social]]
 icon = "fontawesome/brands/discord"

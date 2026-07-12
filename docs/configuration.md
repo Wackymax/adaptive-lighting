@@ -151,18 +151,59 @@ by default:
 - `intelligence_enabled` defaults to `false`;
 - `intelligence_shadow_mode` defaults to `true` and keeps intelligence
   decisions read-only;
+- `intelligence_training_enabled` defaults to `false`; when enabled, the
+  local training adapter starts in `shadow_learning` and keeps the zero-call
+  actuation block in force;
+- `intelligence_training_days` defaults to `7`; the operational rollout
+  minimum is seven days so weekday/weekend and recency variation can be
+  observed;
+- `intelligence_auto_promote` defaults to `false`; if enabled, it can leave
+  shadow mode only after the persisted deadline, minimum sample count,
+  confidence, durability, freshness, capability, and safety gates pass;
+- `intelligence_minimum_samples` defaults to `8`,
+  `intelligence_minimum_confidence` to `0.8`, and
+  `intelligence_durability_seconds` to `120`;
 - context selectors can provide occupancy, presence, illuminance, home,
   security, sleep, media, energy-constraint, manual-hold, and semantic-intent
   signals; and
 - task, ambient, video, night, and prelight brightness caps bound the policy
   targets.
 
-These settings provide context for preview and explanation. They do not grant a
-prediction permission to turn a light on, clear manual control, issue an
-unsupported color command, or claim a melanopic target. See the [context-aware
-intelligence architecture](intelligence-architecture.md) for the full
-processing model, safety priority, sensor-contamination rules, privacy boundary,
-and rollout gates.
+After promotion, adaptation remains continuous but bounded: high-confidence
+proposals require support and fresh context; quick manual reversals are strong
+negative feedback; accepted actions are weak positive feedback; and repeated
+corrections trigger suppression/cooldown. A human or physical power action also
+starts a persisted 30-minute per-entity hold while it is learned. Good Night is
+a learnable semantic routine, while alarm-triggered actions are safety context
+and excluded from training targets. Brightness is capability-conditional:
+dimmable lights can receive brightness changes, while on/off-only lights receive
+only valid power actions. Covers, doors, and garages are context-only and never
+actuated.
+
+These settings do not grant permission to clear manual control, issue an
+unsupported color command, infer a missing sensor, or claim a melanopic target.
+See the [context-aware intelligence architecture](intelligence-architecture.md)
+for the full processing model, multiple temporal horizons, discovery and
+reconciliation rules, local/private ML boundary, safety priority,
+sensor-contamination rules, and rollout gates.
+
+### Intelligence option reference
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `intelligence_enabled` | `false` | Enable context-aware evaluation. |
+| `intelligence_shadow_mode` | `true` | Block intelligence-originated light calls. |
+| `intelligence_training_enabled` | `false` | Persist bounded local shadow-learning state. |
+| `intelligence_training_days` | `7` | Shadow-learning duration; use at least seven days for rollout. |
+| `intelligence_auto_promote` | `false` | Permit active phase only after all gates pass. |
+| `intelligence_minimum_samples` | `8` | Minimum accepted samples for promotion. |
+| `intelligence_minimum_confidence` | `0.8` | Minimum confidence for promotion/learned use. |
+| `intelligence_durability_seconds` | `120` | Required persistence for a manual correction candidate. |
+
+The local learner is interpretable and bounded rather than an opaque cloud
+model. Its state is private to Home Assistant, versioned, resettable, and
+retained only in compact form. Missing, stale, contaminated, or conflicting
+context produces an explicit unknown/no-op or shadow-only result.
 
 ## Related Topics
 
