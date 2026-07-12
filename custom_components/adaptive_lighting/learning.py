@@ -246,7 +246,8 @@ class PreferenceLearner:
         return bool(sample.safety_context) or intent in _SAFETY_INTENTS
 
     def _coerce_sample(
-        self, sample: OverrideSample | Mapping[str, Any]
+        self,
+        sample: OverrideSample | Mapping[str, Any],
     ) -> OverrideSample | None:
         if isinstance(sample, OverrideSample):
             return sample
@@ -344,7 +345,8 @@ class PreferenceLearner:
             return False
 
         observed_offset = max(
-            -self.max_offset, min(self.max_offset, selected - baseline)
+            -self.max_offset,
+            min(self.max_offset, selected - baseline),
         )
         state = self._offsets.setdefault(key, {"offset": 0.0, "count": 0})
         state["offset"] = max(
@@ -376,6 +378,19 @@ class PreferenceLearner:
         return self._offsets.get(key, {}).get("offset", 0.0)
 
     offset = get_offset
+
+    def get_sample_count(
+        self,
+        zone: str,
+        intent: str = _DEFAULT_INTENT,
+        time_bucket: str = _DEFAULT_TIME_BUCKET,
+        daylight_band: str = _DEFAULT_DAYLIGHT_BAND,
+    ) -> int:
+        """Return exact-context support so executors can enforce confidence gates."""
+        key = self._key(zone, intent, time_bucket, daylight_band)
+        if key is None:
+            return 0
+        return int(self._offsets.get(key, {}).get("count", 0))
 
     def adjusted_target(
         self,
