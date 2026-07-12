@@ -32,12 +32,22 @@ from custom_components.adaptive_lighting.context import (
     unavailable,
 )
 from custom_components.adaptive_lighting.explain import explain_decision
-from custom_components.adaptive_lighting.intent import Intent, resolve_intent
+from custom_components.adaptive_lighting.intent import (
+    Intent,
+    async_setup_intents,
+    resolve_intent,
+)
 from custom_components.adaptive_lighting.policy import PolicyConfig, decide
 
 
 def active(value: bool = True, source: str = "test"):
     return signal(value, source=source)
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_intent_platform_setup_is_a_noop() -> None:
+    """HA may load this semantic classifier as its optional intent platform."""
+    await async_setup_intents(object())  # type: ignore[arg-type]
 
 
 def test_priority_emergency_beats_every_other_intent() -> None:

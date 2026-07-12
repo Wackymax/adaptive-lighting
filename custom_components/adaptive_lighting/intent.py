@@ -4,8 +4,25 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from .context import ContextSignal, ContextSnapshot, InputProvenance
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+
+async def async_setup_intents(hass: "HomeAssistant") -> None:
+    """Satisfy Home Assistant's optional intent-platform contract.
+
+    This module contains the intelligence layer's internal semantic intent
+    classifier; it does not register voice-assistant intents. Home Assistant
+    discovers every integration-level ``intent.py`` module as a platform and
+    calls this hook unconditionally. Keeping the no-op adapter here lets the
+    pure classifier retain its focused module name without producing a startup
+    error.
+    """
+    del hass
 
 
 class Intent(str, Enum):
@@ -187,8 +204,7 @@ def _candidate(
 
     name, value = selected
     active = value.value is True or (
-        isinstance(value.value, str)
-        and value.value in _INTENT_HINTS[intent]
+        isinstance(value.value, str) and value.value in _INTENT_HINTS[intent]
     )
     if intent is Intent.VACANT and name == "occupancy":
         active = value.value is False
@@ -222,7 +238,9 @@ def resolve_intent(snapshot: ContextSnapshot) -> IntentResolution:
     if active:
         winner = max(active, key=lambda candidate: candidate.priority)
     else:
-        ambient = next(candidate for candidate in candidates if candidate.intent is Intent.AMBIENT)
+        ambient = next(
+            candidate for candidate in candidates if candidate.intent is Intent.AMBIENT
+        )
         if not ambient.available:
             ambient = IntentCandidate(
                 intent=Intent.AMBIENT,
@@ -261,7 +279,11 @@ def resolve_intent(snapshot: ContextSnapshot) -> IntentResolution:
             ),
         )
         for candidate in sorted(
-            (candidate for candidate in candidates if candidate.intent is not winner.intent),
+            (
+                candidate
+                for candidate in candidates
+                if candidate.intent is not winner.intent
+            ),
             key=lambda candidate: (-candidate.priority, candidate.intent.value),
         )
     )
