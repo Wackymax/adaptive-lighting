@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 _SCHEMA_VERSION = 1
+_DAY_TYPES = frozenset({"public_holiday", "weekday", "weekend"})
 
 
 def _zone(value: Any) -> str:
@@ -59,6 +60,8 @@ class TransitionPrediction:
 
     __slots__ = (
         "confidence",
+        "day_type",
+        "day_type_behavior",
         "expires_at",
         "from_zone",
         "observations",
@@ -76,6 +79,8 @@ class TransitionPrediction:
         prelight_brightness: float,
         time_bucket: str,
         observations: int,
+        day_type: str = "weekday",
+        day_type_behavior: str | None = None,
     ) -> None:
         """Create an immutable-by-convention prediction result."""
         self.from_zone = from_zone
@@ -85,11 +90,18 @@ class TransitionPrediction:
         self.prelight_brightness = prelight_brightness
         self.time_bucket = time_bucket
         self.observations = observations
+        self.day_type = day_type
+        self.day_type_behavior = day_type_behavior or day_type
 
     @property
     def brightness(self) -> float:
         """Alias used by simple actuation adapters."""
         return self.prelight_brightness
+
+    @property
+    def behavior_day_type(self) -> str:
+        """Return the day type whose behavior table supplied the prediction."""
+        return self.day_type_behavior
 
     @property
     def is_expired(self) -> bool:
@@ -102,6 +114,9 @@ class TransitionPrediction:
             "from_zone": self.from_zone,
             "to_zone": self.to_zone,
             "confidence": self.confidence,
+            "day_type": self.day_type,
+            "day_type_behavior": self.day_type_behavior,
+            "behavior_day_type": self.behavior_day_type,
             "expires_at": _serializable_time(self.expires_at),
             "prelight_brightness": self.prelight_brightness,
             "time_bucket": self.time_bucket,
@@ -168,25 +183,107 @@ class SequencePredictor:
         self._global_counts: defaultdict[str, defaultdict[str, int]] = defaultdict(
             lambda: defaultdict(int),
         )
+        self._day_type_counts: defaultdict[
+            tuple[str, str, str],
+            defaultdict[str, int],
+        ] = defaultdict(lambda: defaultdict(int))
         self._last_zone: str | None = None
         self._last_at: datetime | None = None
 
-    def time_bucket(self, at: datetime | float | None = None) -> str:
-        """Return a deterministic local-time bucket identifier.
+    @staticmethod
+    def _resolve_day_type(
+        moment: datetime,
+        day_type: str | None,
+        public_holiday: bool,
+        holiday: bool | None,
+    ) -> tuple[str, str]:
+        if holiday is not None:
+            if not isinstance(holiday, bool):
+                raise TypeError
+            public_holiday = holiday
+        if not isinstance(public_holiday, bool):
+            raise TypeError
+        normalized = _zone(day_type) if day_type is not None else ""
+        if normalized and normalized not in _DAY_TYPES:
+            raise ValueError
+        if public_holiday:
+            if normalized and normalized != "public_holiday":
+                raise ValueError
+            normalized = "public_holiday"
+        if not normalized:
+            normalized = "weekend" if moment.weekday() >= 5 else "weekday"
+        behavior = "weekend" if normalized == "public_holiday" else normalized
+        return normalized, behavior
 
-        Weekday is included, so Monday morning and Saturday morning can learn
-        different priors.  Callers may also pass an explicit string to
-        :meth:`record_transition` for semantic buckets such as ``"evening"``.
-        """
+    def _bucket_context(
+        self,
+        at: datetime | float | None,
+        time_bucket: str | None,
+        day_type: str | None,
+        public_holiday: bool,
+        holiday: bool | None,
+    ) -> tuple[datetime, str, str, str, str | None]:
         moment = _as_datetime(at)
-        slot = (moment.hour * 60 + moment.minute) // self.bucket_minutes
-        return f"{moment.weekday()}:{slot}"
+        label, behavior = self._resolve_day_type(
+            moment,
+            day_type,
+            public_holiday,
+            holiday,
+        )
+        explicit_day_context = (
+            day_type is not None or public_holiday or holiday is not None
+        )
+        if time_bucket is None:
+            slot = (moment.hour * 60 + moment.minute) // self.bucket_minutes
+            return moment, f"{behavior}:{slot}", label, behavior, label
 
-    def _record(self, from_zone: str, to_zone: str, time_bucket: str) -> bool:
+        bucket = _zone(time_bucket)
+        if not bucket:
+            return moment, "", label, behavior, None
+        if bucket.startswith(("weekday:", "weekend:")):
+            provenance = label if explicit_day_context else None
+            return moment, bucket, label, behavior, provenance
+        if explicit_day_context:
+            return moment, f"{behavior}:{bucket}", label, behavior, label
+        # Semantic buckets predate day-type support. Preserve their exact key
+        # unless the caller explicitly supplies a day type or holiday flag.
+        return moment, bucket, label, behavior, None
+
+    def time_bucket(
+        self,
+        at: datetime | float | None = None,
+        *,
+        day_type: str | None = None,
+        public_holiday: bool = False,
+        holiday: bool | None = None,
+    ) -> str:
+        """Return a deterministic day-type and local-time bucket identifier.
+
+        Public holidays retain their label but intentionally use weekend
+        behavior. The caller supplies holiday knowledge; no calendar lookup is
+        performed by this pure module.
+        """
+        return self._bucket_context(
+            at,
+            None,
+            day_type,
+            public_holiday,
+            holiday,
+        )[1]
+
+    def _record(
+        self,
+        from_zone: str,
+        to_zone: str,
+        time_bucket: str,
+        day_type: str | None = None,
+    ) -> bool:
         if not from_zone or not to_zone or not time_bucket or from_zone == to_zone:
             return False
         self._bucket_counts[(from_zone, time_bucket)][to_zone] += 1
         self._global_counts[from_zone][to_zone] += 1
+        if day_type is not None:
+            self._day_type_counts[(from_zone, time_bucket, to_zone)][day_type] += 1
         return True
 
     def record_transition(
@@ -197,14 +294,23 @@ class SequencePredictor:
         *,
         time_bucket: str | None = None,
         timestamp: datetime | float | None = None,
+        day_type: str | None = None,
+        public_holiday: bool = False,
+        holiday: bool | None = None,
     ) -> bool:
         """Record one observed transition and return whether it was accepted."""
         source = _zone(from_zone)
         target = _zone(to_zone)
         if timestamp is not None:
             at = timestamp
-        bucket = _zone(time_bucket) if time_bucket is not None else self.time_bucket(at)
-        return self._record(source, target, bucket)
+        _moment, bucket, _label, _behavior, provenance = self._bucket_context(
+            at,
+            time_bucket,
+            day_type,
+            public_holiday,
+            holiday,
+        )
+        return self._record(source, target, bucket, provenance)
 
     # ``learn`` reads naturally in a recorder adapter.
     learn = record_transition
@@ -215,6 +321,9 @@ class SequencePredictor:
         at: datetime | float | None = None,
         *,
         timestamp: datetime | float | None = None,
+        day_type: str | None = None,
+        public_holiday: bool = False,
+        holiday: bool | None = None,
     ) -> bool:
         """Observe a zone event and learn a transition from the prior event."""
         current = _zone(zone)
@@ -227,7 +336,14 @@ class SequencePredictor:
         if self._last_zone is not None and self._last_at is not None:
             elapsed = (moment - self._last_at).total_seconds()
             if 0 <= elapsed <= self.max_transition_gap_seconds:
-                learned = self.record_transition(self._last_zone, current, at=moment)
+                learned = self.record_transition(
+                    self._last_zone,
+                    current,
+                    at=moment,
+                    day_type=day_type,
+                    public_holiday=public_holiday,
+                    holiday=holiday,
+                )
         self._last_zone = current
         self._last_at = moment
         return learned
@@ -254,6 +370,9 @@ class SequencePredictor:
         brightness: float | None = None,
         time_bucket: str | None = None,
         timestamp: datetime | float | None = None,
+        day_type: str | None = None,
+        public_holiday: bool = False,
+        holiday: bool | None = None,
     ) -> TransitionPrediction | None:
         """Predict the next zone, with confidence, expiry, and a low cap.
 
@@ -266,13 +385,26 @@ class SequencePredictor:
             return None
         if timestamp is not None:
             at = timestamp
-        moment = _as_datetime(at)
-        bucket = (
-            _zone(time_bucket) if time_bucket is not None else self.time_bucket(moment)
+        moment, bucket, day_label, day_behavior, _provenance = self._bucket_context(
+            at,
+            time_bucket,
+            day_type,
+            public_holiday,
+            holiday,
         )
         if not bucket:
             return None
         counts = self._bucket_counts.get((source, bucket), {})
+        if (
+            not counts
+            and time_bucket is None
+            and day_type is None
+            and not public_holiday
+            and holiday is None
+        ):
+            slot = (moment.hour * 60 + moment.minute) // self.bucket_minutes
+            legacy_bucket = f"{moment.weekday()}:{slot}"
+            counts = self._bucket_counts.get((source, legacy_bucket), {})
         global_counts = self._global_counts.get(source, {})
         if not global_counts:
             return None
@@ -308,23 +440,29 @@ class SequencePredictor:
             ),
             time_bucket=bucket,
             observations=target_observations,
+            day_type=day_label,
+            day_type_behavior=day_behavior,
         )
 
     predict_next = predict
 
     def export_state(self) -> dict[str, object]:
         """Export deterministic counts and configuration using JSON scalars."""
-        entries = []
+        entries: list[dict[str, object]] = []
         for (source, bucket), counts in sorted(self._bucket_counts.items()):
             for target, count in sorted(counts.items()):
-                entries.append(
-                    {
-                        "from_zone": source,
-                        "to_zone": target,
-                        "time_bucket": bucket,
-                        "count": count,
-                    },
+                entry: dict[str, object] = {
+                    "from_zone": source,
+                    "to_zone": target,
+                    "time_bucket": bucket,
+                    "count": count,
+                }
+                provenance = self._day_type_counts.get(
+                    (source, bucket, target),
                 )
+                if provenance:
+                    entry["day_type_counts"] = dict(sorted(provenance.items()))
+                entries.append(entry)
         last_event: dict[str, object] | None = None
         if self._last_zone is not None and self._last_at is not None:
             last_event = {
@@ -384,15 +522,51 @@ class SequencePredictor:
             ),
         )
 
+    @staticmethod
+    def _import_day_type_counts(
+        entry: Mapping[str, Any],
+        count: int,
+        bucket: str,
+    ) -> dict[str, int]:
+        raw_counts = entry.get("day_type_counts")
+        if raw_counts is None:
+            return {}
+        if not isinstance(raw_counts, Mapping):
+            raise TypeError
+        imported: dict[str, int] = {}
+        for raw_day_type, raw_count in raw_counts.items():
+            day_type = _zone(raw_day_type)
+            day_count = _positive_int(raw_count)
+            behavior = "weekend" if day_type == "public_holiday" else day_type
+            if (
+                day_type not in _DAY_TYPES
+                or day_count is None
+                or day_type in imported
+                or not bucket.startswith(f"{behavior}:")
+            ):
+                raise ValueError
+            imported[day_type] = day_count
+        if sum(imported.values()) != count:
+            raise ValueError
+        return imported
+
     def _import_counts(
         self,
         entries: list[Any],
         replace: bool,
-    ) -> dict[tuple[str, str], dict[str, int]]:
+    ) -> tuple[
+        dict[tuple[str, str], dict[str, int]],
+        dict[tuple[str, str, str], dict[str, int]],
+    ]:
         imported = (
             {}
             if replace
             else {key: dict(counts) for key, counts in self._bucket_counts.items()}
+        )
+        day_type_counts = (
+            {}
+            if replace
+            else {key: dict(counts) for key, counts in self._day_type_counts.items()}
         )
         seen = {
             (source, bucket, target)
@@ -417,8 +591,11 @@ class SequencePredictor:
             ):
                 raise ValueError
             imported.setdefault((source, bucket), {})[target] = count
+            provenance = self._import_day_type_counts(entry, count, bucket)
+            if provenance:
+                day_type_counts[transition] = provenance
             seen.add(transition)
-        return imported
+        return imported, day_type_counts
 
     def _import_cursor(
         self,
@@ -466,7 +643,7 @@ class SequencePredictor:
         if not isinstance(entries, list):
             raise TypeError
         configured = self._import_configuration(payload.get("config", {}))
-        imported = self._import_counts(entries, replace)
+        imported, day_type_counts = self._import_counts(entries, replace)
         last_zone, last_at = self._import_cursor(payload, replace)
         global_counts = self._global_counts_from_import(imported)
 
@@ -483,6 +660,9 @@ class SequencePredictor:
         self._global_counts = defaultdict(lambda: defaultdict(int))
         for source, counts in global_counts.items():
             self._global_counts[source].update(counts)
+        self._day_type_counts = defaultdict(lambda: defaultdict(int))
+        for transition, counts in day_type_counts.items():
+            self._day_type_counts[transition].update(counts)
         self._last_zone = last_zone
         self._last_at = last_at
 
@@ -526,6 +706,7 @@ class SequencePredictor:
             )
             self._bucket_counts.clear()
             self._global_counts.clear()
+            self._day_type_counts.clear()
             return removed
 
         removed = 0
@@ -539,6 +720,7 @@ class SequencePredictor:
                     continue
                 removed_count = counts.pop(target)
                 removed += removed_count
+                self._day_type_counts.pop((source, _bucket, target), None)
                 self._global_counts[source][target] -= removed_count
                 if self._global_counts[source][target] <= 0:
                     del self._global_counts[source][target]

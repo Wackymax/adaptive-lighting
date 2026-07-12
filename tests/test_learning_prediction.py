@@ -12,7 +12,7 @@ sys.path.insert(
     str(
         Path(__file__).resolve().parents[1]
         / "custom_components"
-        / "adaptive_lighting"
+        / "adaptive_lighting",
     ),
 )
 
@@ -40,7 +40,7 @@ def sample(**overrides: object) -> OverrideSample:
 
 def test_preference_learner_accepts_durable_human_override() -> None:
     learner = PreferenceLearner(
-        learning_rate=0.5, max_offset=20, min_duration_seconds=30
+        learning_rate=0.5, max_offset=20, min_duration_seconds=30,
     )
 
     assert learner.record(sample()) is True
@@ -84,7 +84,7 @@ def test_preference_learner_rejects_non_preference_samples(
 
 def test_preference_learner_uses_bounded_exponential_average() -> None:
     learner = PreferenceLearner(
-        learning_rate=0.5, max_offset=10, min_duration_seconds=0
+        learning_rate=0.5, max_offset=10, min_duration_seconds=0,
     )
 
     assert learner.record(sample(selected=100)) is True
@@ -155,7 +155,7 @@ def test_preference_learner_accepts_json_mapping_aliases() -> None:
 
 def test_preference_learner_export_import_and_reset_are_json_safe() -> None:
     learner = PreferenceLearner(
-        learning_rate=0.5, max_offset=12, min_duration_seconds=0
+        learning_rate=0.5, max_offset=12, min_duration_seconds=0,
     )
     learner.record(sample())
     learner.record(sample(zone="kitchen", selected=10))
@@ -286,6 +286,100 @@ def test_sequence_predictor_uses_global_prior_for_unseen_bucket() -> None:
     assert prediction is not None
     assert prediction.to_zone == "living"
     assert 0 < prediction.confidence < 1
+
+
+def test_sequence_predictor_separates_weekday_and_weekend_buckets() -> None:
+    predictor = SequencePredictor(min_observations=1, prior_strength=0)
+    monday = datetime(2026, 7, 13, 8, tzinfo=UTC)
+    saturday = datetime(2026, 7, 18, 8, tzinfo=UTC)
+    predictor.record_transition("kitchen", "office", at=monday)
+    predictor.record_transition("kitchen", "garden", at=saturday)
+
+    weekday = predictor.predict("kitchen", at=monday)
+    weekend = predictor.predict("kitchen", at=saturday)
+
+    assert weekday is not None
+    assert weekday.to_zone == "office"
+    assert weekday.time_bucket == "weekday:8"
+    assert weekday.day_type == "weekday"
+    assert weekday.day_type_behavior == "weekday"
+    assert weekend is not None
+    assert weekend.to_zone == "garden"
+    assert weekend.time_bucket == "weekend:8"
+    assert weekend.day_type == "weekend"
+    assert weekend.day_type_behavior == "weekend"
+
+
+def test_monday_public_holiday_uses_weekend_behavior_and_keeps_provenance() -> None:
+    predictor = SequencePredictor(min_observations=1, prior_strength=0)
+    saturday = datetime(2026, 7, 18, 9, tzinfo=UTC)
+    monday_holiday = datetime(2026, 7, 13, 9, tzinfo=UTC)
+    predictor.record_transition("bedroom", "kitchen", at=saturday)
+    assert predictor.observe("bedroom", monday_holiday, holiday=True) is False
+    assert predictor.observe(
+        "kitchen",
+        monday_holiday.replace(minute=1),
+        day_type="public_holiday",
+    ) is True
+
+    prediction = predictor.predict(
+        "bedroom",
+        at=monday_holiday,
+        public_holiday=True,
+    )
+
+    assert prediction is not None
+    assert prediction.to_zone == "kitchen"
+    assert prediction.time_bucket == "weekend:9"
+    assert prediction.day_type == "public_holiday"
+    assert prediction.day_type_behavior == "weekend"
+    assert prediction.behavior_day_type == "weekend"
+    assert prediction.as_dict()["day_type"] == "public_holiday"
+    entry = predictor.export_state()["entries"][0]
+    assert entry["day_type_counts"] == {"public_holiday": 1, "weekend": 1}
+
+    restored = SequencePredictor.from_state(
+        json.loads(json.dumps(predictor.export_state())),
+    )
+    assert restored.export_state() == predictor.export_state()
+
+
+def test_sequence_predictor_imports_legacy_bucket_without_day_type_metadata() -> None:
+    payload = {
+        "version": 1,
+        "config": {"min_observations": 1},
+        "entries": [
+            {
+                "from_zone": "bedroom",
+                "to_zone": "kitchen",
+                "time_bucket": "0:8",
+                "count": 1,
+            },
+            {
+                "from_zone": "bedroom",
+                "to_zone": "office",
+                "time_bucket": "1:8",
+                "count": 1,
+            },
+        ],
+        "last_event": None,
+    }
+
+    predictor = SequencePredictor.from_state(payload)
+    monday = predictor.predict(
+        "bedroom",
+        at=datetime(2026, 7, 13, 8, tzinfo=UTC),
+    )
+    tuesday = predictor.predict(
+        "bedroom",
+        at=datetime(2026, 7, 14, 8, tzinfo=UTC),
+    )
+
+    assert monday is not None
+    assert monday.to_zone == "kitchen"
+    assert tuesday is not None
+    assert tuesday.to_zone == "office"
+    assert "day_type_counts" not in predictor.export_state()["entries"][0]
 
 
 def test_sequence_predictor_observe_learns_only_reasonable_adjacent_events() -> None:
