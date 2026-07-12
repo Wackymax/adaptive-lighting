@@ -27,7 +27,7 @@ Resources, tutorials, and related projects for Adaptive Lighting.
 Visualize how different settings affect your lighting throughout the day:
 
 <div style="text-align: center; margin: 2rem 0;">
-  <a href="../simulator/" class="simulator-link">
+  <a href="https://basnijholt.github.io/adaptive-lighting/" class="simulator-link">
     Open the Simulator
   </a>
 </div>
@@ -60,8 +60,8 @@ Adaptive Lighting was initially inspired by [hass-circadian_lighting](https://gi
 
 Interested in contributing to Adaptive Lighting?
 
-- [GitHub Repository](https://github.com/basnijholt/adaptive-lighting)
-- [Issue Tracker](https://github.com/basnijholt/adaptive-lighting/issues)
+- [GitHub Repository](https://github.com/Wackymax/adaptive-lighting)
+- [Issue Tracker](https://github.com/Wackymax/adaptive-lighting/issues)
 - [Translation via Weblate](https://hosted.weblate.org/engage/adaptive-lighting/)
 
 ### Translation

@@ -10,18 +10,20 @@ icon: lucide/sun
   <img src="assets/logo.png" alt="Adaptive Lighting Logo" width="200" />
 </div>
 
-[Adaptive Lighting](https://github.com/basnijholt/adaptive-lighting) is a custom component for [Home Assistant](https://www.home-assistant.io/) that intelligently adjusts the brightness and color of your lights based on the sun's position, while still allowing for manual control.
+[Adaptive Lighting](https://github.com/Wackymax/adaptive-lighting) is a custom component for [Home Assistant](https://www.home-assistant.io/) that adjusts the brightness and color of your lights based on the sun's position, while still allowing for manual control.
 
 <div style="text-align: center; margin: 2rem 0;">
-  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=basnijholt&repository=adaptive-lighting&category=integration" class="md-button md-button--primary">
+  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=Wackymax&repository=adaptive-lighting&category=integration" class="md-button md-button--primary">
     Install via HACS
   </a>
-  <a href="simulator/" class="md-button">
+  <a href="https://basnijholt.github.io/adaptive-lighting/" class="md-button">
     Try the Simulator
   </a>
 </div>
 
-By automatically adapting the settings of your lights throughout the day, Adaptive Lighting helps maintain your natural circadian rhythm, which can lead to improved sleep, mood, and overall well-being. Experience cooler color temperatures at noon, gradually transitioning to warmer colors at sunset and sunrise.
+By automatically adapting the settings of your lights throughout the day, Adaptive Lighting provides a predictable daylight-aligned curve. It is a lighting control component, not a medical, circadian, or melanopic measurement system.
+
+For the fork's implementation boundary and rollout rules, read the [context-aware intelligence architecture](intelligence-architecture.md). For maintenance and upstream sync, see [fork ownership](fork-maintenance.md).
 
 ## Features
 
@@ -79,7 +81,7 @@ Adaptive Lighting provides four switches for each configuration (using "living_r
 Visualize how Adaptive Lighting will work with your settings using the interactive simulator:
 
 <div style="text-align: center; margin: 2rem 0;">
-  <a href="simulator/" class="simulator-link">
+  <a href="https://basnijholt.github.io/adaptive-lighting/" class="simulator-link">
     Try the Interactive Simulator
   </a>
 </div>

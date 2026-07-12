@@ -103,7 +103,7 @@ These lights are known to exhibit disadvantageous behaviour due to firmware bugs
 If you're still having issues:
 
 1. Enable debug logging and capture the relevant logs
-2. Open an issue on [GitHub](https://github.com/basnijholt/adaptive-lighting/issues)
+2. Open an issue on [GitHub](https://github.com/Wackymax/adaptive-lighting/issues)
 3. Include:
    - Your configuration (redact sensitive info)
    - Debug logs

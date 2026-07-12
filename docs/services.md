@@ -199,3 +199,20 @@ automation:
 ```
 
 See [Automation Examples](automation-examples.md) for more use cases.
+
+---
+
+## Intelligence preview and explanation
+
+The context-intelligence foundation exposes two read-only services:
+
+- `adaptive_lighting.preview` evaluates the configured context and publishes a
+  shadow decision;
+- `adaptive_lighting.explain` publishes the same kind of decision with its
+  reasons and input provenance.
+
+These services do not change light state or issue a light service call. The
+intelligence configuration is disabled by default and shadow mode is enabled by
+default. Live executor activation is a later canary stage with separate safety
+gates. See [Context-aware intelligence architecture](intelligence-architecture.md)
+for the configuration boundary and rollout policy.

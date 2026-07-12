@@ -24,11 +24,11 @@ This guide will help you install and configure Adaptive Lighting for the first t
 
 Or use this button to open HACS directly:
 
-[![Open your Home Assistant instance and open the Adaptive Lighting integration inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=basnijholt&repository=adaptive-lighting&category=integration)
+[![Open your Home Assistant instance and open the Adaptive Lighting integration inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Wackymax&repository=adaptive-lighting&category=integration)
 
 ### Manual Installation
 
-1. Download the latest release from [GitHub](https://github.com/basnijholt/adaptive-lighting/releases)
+1. Download the latest release from [GitHub](https://github.com/Wackymax/adaptive-lighting/releases)
 2. Extract the `adaptive_lighting` folder to your `config/custom_components/` directory
 3. Restart Home Assistant
 

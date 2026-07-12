@@ -143,6 +143,27 @@ adaptive_lighting:
     sleep_color_temp: 1000
 ```
 
+## Context intelligence foundation
+
+The fork's context-intelligence foundation is opt-in and remains non-actuating
+by default:
+
+- `intelligence_enabled` defaults to `false`;
+- `intelligence_shadow_mode` defaults to `true` and keeps intelligence
+  decisions read-only;
+- context selectors can provide occupancy, presence, illuminance, home,
+  security, sleep, media, energy-constraint, manual-hold, and semantic-intent
+  signals; and
+- task, ambient, video, night, and prelight brightness caps bound the policy
+  targets.
+
+These settings provide context for preview and explanation. They do not grant a
+prediction permission to turn a light on, clear manual control, issue an
+unsupported color command, or claim a melanopic target. See the [context-aware
+intelligence architecture](intelligence-architecture.md) for the full
+processing model, safety priority, sensor-contamination rules, privacy boundary,
+and rollout gates.
+
 ## Related Topics
 
 - [Brightness Modes](advanced/brightness-modes.md) - Detailed explanation of brightness calculation modes

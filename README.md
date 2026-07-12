@@ -1,5 +1,5 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/hacs/integration)
-![Version](https://img.shields.io/github/v/release/basnijholt/adaptive-lighting?style=for-the-badge)
+![Version](https://img.shields.io/github/v/release/Wackymax/adaptive-lighting?style=for-the-badge)
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 [![All Contributors](https://img.shields.io/badge/all_contributors-134-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
@@ -8,13 +8,13 @@
 
 <img src="https://raw.githubusercontent.com/home-assistant/brands/master/custom_integrations/adaptive_lighting/icon@2x.png" alt="logo" width="256px" height="256px" />
 
-[Adaptive Lighting](https://github.com/basnijholt/adaptive-lighting) is a custom component for [Home Assistant](https://www.home-assistant.io/) that intelligently adjusts the brightness and color of your lights 💡 based on the sun's position, while still allowing for manual control.
+[Adaptive Lighting](https://github.com/Wackymax/adaptive-lighting) is a custom component for [Home Assistant](https://www.home-assistant.io/) that adjusts the brightness and color of your lights 💡 based on the sun's position, while still allowing for manual control.
 
 Download and install directly through [HACS (Home Assistant Community Store)](https://hacs.xyz/):
 
-[![Open your Home Assistant instance and open the Adaptive Lighting integration inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=basnijholt&repository=adaptive-lighting&category=integration)
+[![Open your Home Assistant instance and open the Adaptive Lighting integration inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Wackymax&repository=adaptive-lighting&category=integration)
 
-By automatically adapting the settings of your lights throughout the day, Adaptive Lighting helps maintain your natural circadian rhythm 😴, which can lead to improved sleep, mood, and overall well-being. Experience cooler color temperatures at noon, gradually transitioning to warmer colors at sunset and sunrise.
+By automatically adapting the settings of your lights throughout the day, Adaptive Lighting provides a predictable daylight-aligned curve. It is a lighting control component, not a medical, circadian, or melanopic measurement system. Color temperature transitions are available only for lights that expose a compatible color capability.
 
 In addition to its regular mode, Adaptive Lighting also offers a "sleep mode" 🌜 which sets your lights to minimal brightness and a very warm color, perfect for winding down at night.
 
@@ -23,6 +23,16 @@ In addition to its regular mode, Adaptive Lighting also offers a "sleep mode" �
 https://github.com/basnijholt/adaptive-lighting/assets/6897215/68908f7d-fbf1-4991-98ce-3f2af6df996f
 
 [[ToC](#books-table-of-contents)]
+
+## Fork and architecture documentation
+
+This Wackymax fork retains the upstream project's history and attribution. See
+[fork ownership and upstream synchronization](docs/fork-maintenance.md) for
+maintenance rules, and [the context-aware intelligence architecture](docs/intelligence-architecture.md)
+for the implemented foundation, safety invariants, staged rollout, and
+Toothless capability boundaries. Contextual prediction and local learning are
+documented as bounded foundation primitives with later activation stages; they
+are not autonomous current configuration options.
 
 <!-- SECTION:features:START -->
 ## :bulb: Features

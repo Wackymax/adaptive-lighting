@@ -112,4 +112,4 @@ iphone_carly_wakeup:
 <!-- OUTPUT:END -->
 
 > [!TIP]
-> **Have a useful automation?** Share your automation examples by [opening an issue](https://github.com/basnijholt/adaptive-lighting/issues) or submitting a pull request to the README.
+> **Have a useful automation?** Share your automation examples by [opening an issue](https://github.com/Wackymax/adaptive-lighting/issues) or submitting a pull request to the README.
