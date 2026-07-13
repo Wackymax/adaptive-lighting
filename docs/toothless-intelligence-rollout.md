@@ -96,7 +96,7 @@ The native controller enforces the following invariants:
   adaptation resumes;
 - it uses `sensor.living_room_lamp_target_brightness` as the room estimate and
   enforces a 1–30% shared envelope with fixture-specific floors. The living-room
-  lamp is held at its observed 5% usable floor; the kitchen strip may use 1%,
+  lamp is held at its observed 6% usable floor; the kitchen strip may use 1%,
   Home Assistant's lowest non-off brightness. Although the strip hardware can
   dim to zero, Home Assistant defines brightness zero as a power-off command,
   so zero remains part of learned on/off behavior rather than brightness
