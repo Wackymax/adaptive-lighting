@@ -82,6 +82,7 @@ All configuration options are listed below with their default values. These opti
 | `intelligence_enabled`                    | Enable context-intelligence target evaluation. It does not turn lights on.                                                                                                                                                                                                                                                                                                                    | `False`        | `bool`                                  |
 | `intelligence_shadow_mode`                | Compute and expose intelligence decisions without any Adaptive Lighting light service calls.                                                                                                                                                                                                                                                                                                  | `True`         | `bool`                                  |
 | `intelligence_shadow_baseline_brightness` | While intelligence remains in shadow, allow only deterministic Adaptive Lighting brightness adaptation for configured lights that are already on or are being turned on by an external command. This never grants intelligence permission to choose a light's power state or adapt color.                                                                                                     | `False`        | `bool`                                  |
+| `intelligence_light_min_brightness`       | Optional mapping of light entity IDs to intelligence minimum brightness percentages. Configured values apply only to authorized intelligence brightness targets; values must be 1-100 because Home Assistant interprets brightness 0 as power off.                                                                                                                                              | `{}`           | `dict`                                  |
 | `intelligence_training_enabled`           | Learn bounded local preferences in shadow mode.                                                                                                                                                                                                                                                                                                                                               | `False`        | `bool`                                  |
 | `intelligence_training_days`              | Days to observe before promotion is evaluated.                                                                                                                                                                                                                                                                                                                                                | `7`            | `int` 1-365                             |
 | `intelligence_auto_promote`               | After training gates pass, permit high-confidence active adjustments.                                                                                                                                                                                                                                                                                                                         | `False`        | `bool`                                  |
@@ -180,6 +181,10 @@ by default:
   enabled it permits only the deterministic brightness baseline for lights that
   are already on or are being turned on by an external bare command. It grants
   no learned power-state authority and never adapts color;
+- `intelligence_light_min_brightness` optionally maps individual light entity
+  IDs to minimum brightness percentages for authorized intelligence targets.
+  Values are 1–100: Home Assistant treats brightness zero as power off, so it
+  cannot be used as a dimming floor without granting power-state authority;
 - `intelligence_training_enabled` defaults to `false`; when enabled, the
   local training adapter starts in `shadow_learning` and keeps the zero-call
   actuation block in force;
@@ -223,6 +228,7 @@ sensor-contamination rules, and rollout gates.
 | `intelligence_enabled` | `false` | Enable context-aware evaluation. |
 | `intelligence_shadow_mode` | `true` | Block intelligence-originated light calls. |
 | `intelligence_shadow_baseline_brightness` | `false` | Opt in to brightness-only deterministic adaptation during shadow, without learned power authority. |
+| `intelligence_light_min_brightness` | `{}` | Per-light 1–100% floors for authorized intelligence brightness targets; zero is intentionally invalid because Home Assistant treats it as off. |
 | `intelligence_training_enabled` | `false` | Persist bounded local shadow-learning state. |
 | `intelligence_training_days` | `7` | Shadow-learning duration; use at least seven days for rollout. |
 | `intelligence_auto_promote` | `false` | Permit active phase only after all gates pass. |

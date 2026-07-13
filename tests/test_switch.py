@@ -26,6 +26,7 @@ from homeassistant.components.adaptive_lighting.color_and_brightness import (
     lerp_color_hsv,
 )
 from homeassistant.components.adaptive_lighting.const import (
+    _DOMAIN_SCHEMA,
     ADAPT_BRIGHTNESS_SWITCH,
     ADAPT_COLOR_SWITCH,
     ATTR_ADAPTIVE_LIGHTING_MANAGER,
@@ -41,6 +42,7 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_INTELLIGENCE_AUTO_PROMOTE,
     CONF_INTELLIGENCE_DURABILITY_SECONDS,
     CONF_INTELLIGENCE_ENABLED,
+    CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS,
     CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
     CONF_INTELLIGENCE_MINIMUM_SAMPLES,
     CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
@@ -444,6 +446,7 @@ async def test_adaptive_lighting_switches(hass):
     assert UNDO_UPDATE_LISTENER in data
 
     assert len(data.keys()) == 5
+    assert switch._intelligence_light_min_brightness == {}
 
 
 async def test_shadow_intelligence_skips_initial_and_reactivation_light_calls(hass):
@@ -571,6 +574,7 @@ async def test_shadow_baseline_never_powers_on_an_off_light(hass):
             CONF_INTELLIGENCE_ENABLED: True,
             CONF_INTELLIGENCE_SHADOW_MODE: True,
             CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS: True,
+            CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS: {ENTITY_LIGHT_3: 1},
         },
     )
     service_calls = []
@@ -591,6 +595,65 @@ async def test_shadow_baseline_never_powers_on_an_off_light(hass):
         if event.data.get("domain") == LIGHT_DOMAIN
         and event.data.get("service") == SERVICE_TURN_ON
     ]
+
+
+async def test_intelligence_light_min_brightness_shadow_override_and_fallback(hass):
+    """Shadow targets use the fixture override or the global minimum fallback."""
+    hass.states.async_set("sensor.ambient_recommendation", "3")
+    hass.states.async_set("sensor.semantic_intent", "ambient")
+    hass.states.async_set("binary_sensor.room_occupied", STATE_ON)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_MIN_BRIGHTNESS: 15,
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS: True,
+            CONF_AMBIENT_BRIGHTNESS_ENTITY: "sensor.ambient_recommendation",
+            CONF_SEMANTIC_INTENT_ENTITY: "sensor.semantic_intent",
+            CONF_OCCUPANCY_ENTITIES: ["binary_sensor.room_occupied"],
+            CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS: {ENTITY_LIGHT_1: 5},
+        },
+    )
+
+    assert switch._intelligence_target_brightness(ENTITY_LIGHT_1, 3) == 5
+    assert switch._intelligence_target_brightness(ENTITY_LIGHT_2, 3) == 15
+
+
+async def test_intelligence_light_min_brightness_applies_in_active_phase(hass):
+    """Active intelligence applies a fixture floor to an authorized target."""
+    hass.states.async_set("input_boolean.sleep", STATE_ON)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: False,
+            CONF_SLEEP_ENTITY: "input_boolean.sleep",
+            CONF_NIGHT_BRIGHTNESS_CAP: 1,
+            CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS: {ENTITY_LIGHT_1: 5},
+        },
+    )
+
+    await switch._update_attrs_and_maybe_adapt_lights(
+        context=switch.create_context("active-floor"),
+        transition=0,
+        force=True,
+    )
+    await hass.async_block_till_done()
+
+    assert switch.manager.last_service_data[ENTITY_LIGHT_1][ATTR_BRIGHTNESS] == round(
+        255 * 5 / 100,
+    )
+
+
+def test_intelligence_light_min_brightness_rejects_zero():
+    """Zero is invalid because Home Assistant treats it as a power-off value."""
+    with pytest.raises(voluptuous.error.Invalid):
+        _DOMAIN_SCHEMA(
+            {
+                CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS: {ENTITY_LIGHT_1: 0},
+            },
+        )
 
 
 async def test_shadow_baseline_respects_manual_hold_on_external_turn_on(hass):

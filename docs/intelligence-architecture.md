@@ -513,6 +513,11 @@ inert-by-default settings:
   brightness-only deterministic baseline while behavior learning remains
   shadow-blocked. It may adjust configured lights already on or add a bounded
   target to an external bare turn-on, but cannot choose a power state or color;
+- `intelligence_light_min_brightness` (default `{}`): optional per-light
+  hardware floors for authorized intelligence brightness targets in shadow and
+  active phases. Values start at 1% because Home Assistant interprets brightness
+  zero as power off; the floor constrains brightness but grants no power-state
+  permission;
 - `intelligence_training_enabled` (default `false`): enable local shadow
   learning and its private bounded store;
 - `intelligence_training_days` (default `7`): minimum operational rollout is

@@ -304,6 +304,17 @@ DOCS[CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS] = (
     "choose a light's power state or adapt color."
 )
 
+CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS, DEFAULT_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS = (
+    "intelligence_light_min_brightness",
+    {},
+)
+DOCS[CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS] = (
+    "Optional mapping of light entity IDs to intelligence minimum brightness "
+    "percentages. Configured values apply only to authorized intelligence brightness "
+    "targets; values must be 1-100 because Home Assistant interprets brightness 0 "
+    "as power off."
+)
+
 CONF_INTELLIGENCE_TRAINING_ENABLED, DEFAULT_INTELLIGENCE_TRAINING_ENABLED = (
     "intelligence_training_enabled",
     False,
@@ -561,6 +572,14 @@ VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
         CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
         DEFAULT_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
         bool,
+    ),
+    (
+        CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS,
+        DEFAULT_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS,
+        vol.All(
+            vol.Schema({cv.entity_id: int_between(1, 100)}),
+            vol.Coerce(dict),
+        ),
     ),
     (
         CONF_INTELLIGENCE_TRAINING_ENABLED,

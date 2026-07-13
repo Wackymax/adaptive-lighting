@@ -111,6 +111,7 @@ from .const import (
     CONF_INTELLIGENCE_AUTO_PROMOTE,
     CONF_INTELLIGENCE_DURABILITY_SECONDS,
     CONF_INTELLIGENCE_ENABLED,
+    CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS,
     CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
     CONF_INTELLIGENCE_MINIMUM_SAMPLES,
     CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
@@ -1483,6 +1484,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._intelligence_shadow_baseline_brightness = data[
             CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS
         ]
+        self._intelligence_light_min_brightness: dict[str, int] = dict(
+            data[CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS],
+        )
         self._intelligence_training_config = {
             "enabled": data[CONF_INTELLIGENCE_TRAINING_ENABLED],
             "training_days": data[CONF_INTELLIGENCE_TRAINING_DAYS],
@@ -3465,15 +3469,14 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         self._intelligence_decisions[light] = decision
         target = int(decision["target_brightness_pct"])
-        if shadow_baseline:
-            # The room estimate refines the tanh curve; it does not escape the
-            # configured Adaptive Lighting envelope. This is especially
-            # important on an external turn-on, where an estimate near zero
-            # could otherwise power a dimmable fixture at an unusable level.
-            target = max(
-                round(self._minimum_brightness),
-                min(baseline_brightness_pct, target),
+        minimum_brightness = self._intelligence_light_min_brightness.get(light)
+        if minimum_brightness is None:
+            minimum_brightness = (
+                round(self._minimum_brightness) if shadow_baseline else 1
             )
+        # The floor constrains an already-authorized brightness target. It does
+        # not create permission to turn a light on or off.
+        target = max(minimum_brightness, min(baseline_brightness_pct, target))
         if external_turn_on:
             # The caller owns the turn-on. We add only a bounded brightness
             # target to the same request, even though intelligence itself has
