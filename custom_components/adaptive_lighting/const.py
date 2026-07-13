@@ -290,6 +290,20 @@ DOCS[CONF_INTELLIGENCE_SHADOW_MODE] = (
     "Compute and expose intelligence decisions without any Adaptive Lighting light service calls."
 )
 
+(
+    CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
+    DEFAULT_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
+) = (
+    "intelligence_shadow_baseline_brightness",
+    False,
+)
+DOCS[CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS] = (
+    "While intelligence remains in shadow, allow only deterministic Adaptive Lighting "
+    "brightness adaptation for configured lights that are already on or are being "
+    "turned on by an external command. This never grants intelligence permission to "
+    "choose a light's power state or adapt color."
+)
+
 CONF_INTELLIGENCE_TRAINING_ENABLED, DEFAULT_INTELLIGENCE_TRAINING_ENABLED = (
     "intelligence_training_enabled",
     False,
@@ -344,6 +358,10 @@ CONF_SEMANTIC_INTENT_ENTITY, DEFAULT_SEMANTIC_INTENT_ENTITY = (
     "semantic_intent_entity",
     None,
 )
+CONF_AMBIENT_BRIGHTNESS_ENTITY, DEFAULT_AMBIENT_BRIGHTNESS_ENTITY = (
+    "ambient_brightness_entity",
+    None,
+)
 
 # These are caps, rather than requested brightnesses.  A policy can therefore
 # lower the existing Adaptive Lighting target without bypassing its baseline.
@@ -385,6 +403,7 @@ DOCS.update(
         CONF_ENERGY_CONSTRAINT_ENTITY: "Entity ID containing an energy constraint.",
         CONF_MANUAL_HOLD_ENTITY: "Entity ID that holds manual takeover.",
         CONF_SEMANTIC_INTENT_ENTITY: "Entity ID containing a semantic lighting intent.",
+        CONF_AMBIENT_BRIGHTNESS_ENTITY: "Entity ID containing a recommended ambient brightness percentage.",
         CONF_TASK_BRIGHTNESS_CAP: "Maximum brightness percentage for task intent.",
         CONF_AMBIENT_BRIGHTNESS_CAP: "Maximum brightness percentage for ambient intent.",
         CONF_VIDEO_BRIGHTNESS_CAP: "Maximum brightness percentage for video intent.",
@@ -539,6 +558,11 @@ VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
     (CONF_INTELLIGENCE_ENABLED, DEFAULT_INTELLIGENCE_ENABLED, bool),
     (CONF_INTELLIGENCE_SHADOW_MODE, DEFAULT_INTELLIGENCE_SHADOW_MODE, bool),
     (
+        CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
+        DEFAULT_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
+        bool,
+    ),
+    (
         CONF_INTELLIGENCE_TRAINING_ENABLED,
         DEFAULT_INTELLIGENCE_TRAINING_ENABLED,
         bool,
@@ -592,6 +616,11 @@ VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
     (
         CONF_SEMANTIC_INTENT_ENTITY,
         DEFAULT_SEMANTIC_INTENT_ENTITY,
+        vol.Any(cv.entity_id, None),
+    ),
+    (
+        CONF_AMBIENT_BRIGHTNESS_ENTITY,
+        DEFAULT_AMBIENT_BRIGHTNESS_ENTITY,
         vol.Any(cv.entity_id, None),
     ),
     (CONF_TASK_BRIGHTNESS_CAP, DEFAULT_TASK_BRIGHTNESS_CAP, int_between(1, 100)),

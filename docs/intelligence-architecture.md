@@ -391,9 +391,13 @@ Rollout is a progression of evidence, not a single feature flag:
 3. **Minimum seven-day shadow/learning:** enable
    `intelligence_training_enabled` with a training duration of at least seven
    days. The training session records bounded local evidence and proposals,
-   but zero Adaptive Lighting light service calls are permitted. The shadow
-   actuation block remains in force during the entire phase, including manual
-   refreshes, restarts, and deadline processing.
+   but zero learned power-state service calls are permitted. By default this is
+   also a zero-light-call phase. An explicitly configured
+   `intelligence_shadow_baseline_brightness` exception may run the deterministic
+   brightness baseline only for an already-on dimmable light or by enriching a
+   caller-owned bare turn-on; it never grants learned power authority or color
+   adaptation. The shadow behavior-actuation block remains in force during the
+   entire phase, including manual refreshes, restarts, and deadline processing.
 4. **Gate evaluation and auto-promotion:** at or after the persisted deadline,
    evaluate minimum accepted samples, confidence, durable observations,
    freshness/contamination quality, no manual-hold violations, no unsupported
@@ -456,6 +460,10 @@ inert-by-default settings:
   evaluation; it does not by itself turn lights on;
 - `intelligence_shadow_mode` (default `true`): keep intelligence decisions
   read-only and prevent intelligence-originated light service calls;
+- `intelligence_shadow_baseline_brightness` (default `false`): allow a narrow,
+  brightness-only deterministic baseline while behavior learning remains
+  shadow-blocked. It may adjust configured lights already on or add a bounded
+  target to an external bare turn-on, but cannot choose a power state or color;
 - `intelligence_training_enabled` (default `false`): enable local shadow
   learning and its private bounded store;
 - `intelligence_training_days` (default `7`): minimum operational rollout is
@@ -468,7 +476,8 @@ inert-by-default settings:
 - `intelligence_durability_seconds` (default `120`): how long a manual
   brightness correction must persist before it becomes learning evidence;
 - context selectors for occupancy, presence, illuminance, home, security,
-  sleep, media, energy constraints, manual hold, and semantic intent; and
+  sleep, media, energy constraints, manual hold, semantic intent, and an
+  optional room-estimated ambient brightness percentage; and
 - bounded intent caps for task, ambient, video, night, and prelight brightness.
 
 The `adaptive_lighting.preview` and `adaptive_lighting.explain` service seams

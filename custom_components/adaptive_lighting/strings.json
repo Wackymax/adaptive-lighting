@@ -65,18 +65,26 @@
           "intercept": "intercept: Intercept and adapt `light.turn_on` calls to enabling instantaneous color and brightness adaptation. 🏎️ Disable for lights that do not support `light.turn_on` with color and brightness.",
           "multi_light_intercept": "multi_light_intercept: Intercept and adapt `light.turn_on` calls that target multiple lights. ➗⚠️ This might result in splitting up a single `light.turn_on` call into multiple calls, e.g., when lights are in different switches. Requires `intercept` to be enabled.",
           "include_config_in_attributes": "include_config_in_attributes: Show all options as attributes on the switch in Home Assistant when set to `true`. 📝",
-          "intelligence_enabled": "intelligence_enabled: Enable additive context-intelligence evaluation.",
-          "intelligence_shadow_mode": "intelligence_shadow_mode: Compute and expose decisions without any Adaptive Lighting light service calls.",
-          "occupancy_entities": "occupancy_entities",
-          "presence_entities": "presence_entities",
-          "illuminance_entities": "illuminance_entities",
+          "intelligence_enabled": "intelligence_enabled: Enable context-intelligence target evaluation. It does not turn lights on.",
+          "intelligence_shadow_mode": "intelligence_shadow_mode: Compute and expose intelligence decisions without any Adaptive Lighting light service calls.",
+          "intelligence_shadow_baseline_brightness": "intelligence_shadow_baseline_brightness: While intelligence remains in shadow, allow only deterministic Adaptive Lighting brightness adaptation for configured lights that are already on or are being turned on by an external command. This never grants intelligence permission to choose a light's power state or adapt color.",
+          "intelligence_training_enabled": "intelligence_training_enabled: Learn bounded local preferences in shadow mode.",
+          "intelligence_training_days": "intelligence_training_days",
+          "intelligence_auto_promote": "intelligence_auto_promote: After training gates pass, permit high-confidence active adjustments.",
+          "intelligence_minimum_samples": "intelligence_minimum_samples",
+          "intelligence_minimum_confidence": "intelligence_minimum_confidence",
+          "intelligence_durability_seconds": "intelligence_durability_seconds",
+          "occupancy_entities": "occupancy_entities: Entity IDs used as occupancy context signals.",
+          "presence_entities": "presence_entities: Entity IDs used as presence context signals.",
+          "illuminance_entities": "illuminance_entities: Entity IDs used as illuminance context signals.",
           "home_state_entity": "home_state_entity",
-          "security_state_entity": "security_state_entity",
-          "sleep_entity": "sleep_entity",
-          "media_entities": "media_entities",
+          "security_state_entity": "security_state_entity: Entity ID containing the security state.",
+          "sleep_entity": "sleep_entity: Entity ID containing the sleep state.",
+          "media_entities": "media_entities: Media-player entity IDs used as media context signals.",
           "energy_constraint_entity": "energy_constraint_entity",
-          "manual_hold_entity": "manual_hold_entity",
+          "manual_hold_entity": "manual_hold_entity: Entity ID that holds manual takeover.",
           "semantic_intent_entity": "semantic_intent_entity",
+          "ambient_brightness_entity": "ambient_brightness_entity",
           "task_brightness_cap": "task_brightness_cap",
           "ambient_brightness_cap": "ambient_brightness_cap",
           "video_brightness_cap": "video_brightness_cap",
@@ -107,7 +115,14 @@
           "autoreset_control_seconds": "Automatically reset the manual control after a number of seconds. Set to 0 to disable. ⏲️",
           "send_split_delay": "Delay (ms) between `separate_turn_on_commands` for lights that don't support simultaneous brightness and color setting. ⏲️",
           "adapt_delay": "Wait time (seconds) between light turn on and Adaptive Lighting applying changes. Might help to avoid flickering. ⏲️",
-          "intelligence_shadow_mode": "Keep intelligence in true no-actuation shadow mode; active mode only overrides brightness for lights that are already on.",
+          "intelligence_training_days": "Days to observe before promotion is evaluated.",
+          "intelligence_minimum_samples": "Minimum accepted human preference samples before promotion.",
+          "intelligence_minimum_confidence": "Minimum promotion confidence from 0 to 1.",
+          "intelligence_durability_seconds": "Seconds a manual correction must persist before learning.",
+          "home_state_entity": "Entity ID containing the home/away state.",
+          "energy_constraint_entity": "Entity ID containing an energy constraint.",
+          "semantic_intent_entity": "Entity ID containing a semantic lighting intent.",
+          "ambient_brightness_entity": "Entity ID containing a recommended ambient brightness percentage.",
           "task_brightness_cap": "Maximum brightness percentage for task intent.",
           "ambient_brightness_cap": "Maximum brightness percentage for ambient intent.",
           "video_brightness_cap": "Maximum brightness percentage for video intent.",
@@ -299,54 +314,107 @@
           "name": "autoreset_control_seconds"
         },
         "intelligence_enabled": {
-          "description": "Enable additive context-intelligence evaluation.",
+          "description": "Enable context-intelligence target evaluation. It does not turn lights on.",
           "name": "intelligence_enabled"
         },
         "intelligence_shadow_mode": {
-          "description": "Compute and expose decisions without any Adaptive Lighting light service calls.",
+          "description": "Compute and expose intelligence decisions without any Adaptive Lighting light service calls.",
           "name": "intelligence_shadow_mode"
         },
-        "occupancy_entities": {"description": "Entity IDs used as occupancy context signals.", "name": "occupancy_entities"},
-        "presence_entities": {"description": "Entity IDs used as presence context signals.", "name": "presence_entities"},
-        "illuminance_entities": {"description": "Entity IDs used as illuminance context signals.", "name": "illuminance_entities"},
-        "home_state_entity": {"description": "Entity ID containing the home/away state.", "name": "home_state_entity"},
-        "security_state_entity": {"description": "Entity ID containing the security state.", "name": "security_state_entity"},
-        "sleep_entity": {"description": "Entity ID containing the sleep state.", "name": "sleep_entity"},
-        "media_entities": {"description": "Media-player entity IDs used as media context signals.", "name": "media_entities"},
-        "energy_constraint_entity": {"description": "Entity ID containing an energy constraint.", "name": "energy_constraint_entity"},
-        "manual_hold_entity": {"description": "Entity ID that holds manual takeover.", "name": "manual_hold_entity"},
-        "semantic_intent_entity": {"description": "Entity ID containing a semantic lighting intent.", "name": "semantic_intent_entity"},
-        "task_brightness_cap": {"description": "Maximum brightness percentage for task intent.", "name": "task_brightness_cap"},
-        "ambient_brightness_cap": {"description": "Maximum brightness percentage for ambient intent.", "name": "ambient_brightness_cap"},
-        "video_brightness_cap": {"description": "Maximum brightness percentage for video intent.", "name": "video_brightness_cap"},
-        "night_brightness_cap": {"description": "Maximum brightness percentage for night intent.", "name": "night_brightness_cap"},
-        "prelight_brightness_cap": {"description": "Maximum brightness percentage for prelight intent.", "name": "prelight_brightness_cap"}
+        "intelligence_shadow_baseline_brightness": {
+          "description": "While intelligence remains in shadow, allow only deterministic Adaptive Lighting brightness adaptation for configured lights that are already on or are being turned on by an external command. This never grants intelligence permission to choose a light's power state or adapt color.",
+          "name": "intelligence_shadow_baseline_brightness"
+        },
+        "occupancy_entities": {
+          "description": "Entity IDs used as occupancy context signals.",
+          "name": "occupancy_entities"
+        },
+        "presence_entities": {
+          "description": "Entity IDs used as presence context signals.",
+          "name": "presence_entities"
+        },
+        "illuminance_entities": {
+          "description": "Entity IDs used as illuminance context signals.",
+          "name": "illuminance_entities"
+        },
+        "home_state_entity": {
+          "description": "Entity ID containing the home/away state.",
+          "name": "home_state_entity"
+        },
+        "security_state_entity": {
+          "description": "Entity ID containing the security state.",
+          "name": "security_state_entity"
+        },
+        "sleep_entity": {
+          "description": "Entity ID containing the sleep state.",
+          "name": "sleep_entity"
+        },
+        "media_entities": {
+          "description": "Media-player entity IDs used as media context signals.",
+          "name": "media_entities"
+        },
+        "energy_constraint_entity": {
+          "description": "Entity ID containing an energy constraint.",
+          "name": "energy_constraint_entity"
+        },
+        "manual_hold_entity": {
+          "description": "Entity ID that holds manual takeover.",
+          "name": "manual_hold_entity"
+        },
+        "semantic_intent_entity": {
+          "description": "Entity ID containing a semantic lighting intent.",
+          "name": "semantic_intent_entity"
+        },
+        "ambient_brightness_entity": {
+          "description": "Entity ID containing a recommended ambient brightness percentage.",
+          "name": "ambient_brightness_entity"
+        },
+        "task_brightness_cap": {
+          "description": "Maximum brightness percentage for task intent.",
+          "name": "task_brightness_cap"
+        },
+        "ambient_brightness_cap": {
+          "description": "Maximum brightness percentage for ambient intent.",
+          "name": "ambient_brightness_cap"
+        },
+        "video_brightness_cap": {
+          "description": "Maximum brightness percentage for video intent.",
+          "name": "video_brightness_cap"
+        },
+        "night_brightness_cap": {
+          "description": "Maximum brightness percentage for night intent.",
+          "name": "night_brightness_cap"
+        },
+        "prelight_brightness_cap": {
+          "description": "Maximum brightness percentage for prelight intent.",
+          "name": "prelight_brightness_cap"
+        }
       }
     },
     "preview": {
       "name": "preview",
-      "description": "Publish a read-only context-intelligence preview without changing any lights.",
+      "description": "Publish a read-only context-intelligence preview event without changing any lights.",
       "fields": {
         "entity_id": {
-          "description": "The Adaptive Lighting switch to preview.",
+          "description": "Entity ID of the switch. 📝",
           "name": "entity_id"
         },
         "lights": {
-          "description": "Optional light entity IDs to preview.",
+          "description": "List of light entity_ids to be controlled (may be empty). 🌟",
           "name": "lights"
         }
       }
     },
     "explain": {
       "name": "explain",
-      "description": "Publish a read-only context-intelligence explanation without changing any lights.",
+      "description": "Publish a read-only context-intelligence explanation event without changing any lights.",
       "fields": {
         "entity_id": {
-          "description": "The Adaptive Lighting switch to explain.",
+          "description": "Entity ID of the switch. 📝",
           "name": "entity_id"
         },
         "lights": {
-          "description": "Optional light entity IDs to explain.",
+          "description": "List of light entity_ids to be controlled (may be empty). 🌟",
           "name": "lights"
         }
       }

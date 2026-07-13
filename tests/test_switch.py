@@ -31,6 +31,7 @@ from homeassistant.components.adaptive_lighting.const import (
     ATTR_ADAPTIVE_LIGHTING_MANAGER,
     CONF_ADAPT_ONLY_ON_BARE_TURN_ON,
     CONF_ADAPT_UNTIL_SLEEP,
+    CONF_AMBIENT_BRIGHTNESS_ENTITY,
     CONF_AUTORESET_CONTROL,
     CONF_BRIGHTNESS_MODE,
     CONF_BRIGHTNESS_MODE_TIME_DARK,
@@ -42,6 +43,7 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_INTELLIGENCE_ENABLED,
     CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
     CONF_INTELLIGENCE_MINIMUM_SAMPLES,
+    CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
     CONF_INTELLIGENCE_SHADOW_MODE,
     CONF_INTELLIGENCE_TRAINING_DAYS,
     CONF_INTELLIGENCE_TRAINING_ENABLED,
@@ -49,9 +51,11 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_MANUAL_HOLD_ENTITY,
     CONF_MAX_BRIGHTNESS,
     CONF_MEDIA_ENTITIES,
+    CONF_MIN_BRIGHTNESS,
     CONF_MIN_COLOR_TEMP,
     CONF_MULTI_LIGHT_INTERCEPT,
     CONF_NIGHT_BRIGHTNESS_CAP,
+    CONF_OCCUPANCY_ENTITIES,
     CONF_PREFER_RGB_COLOR,
     CONF_SECURITY_STATE_ENTITY,
     CONF_SEMANTIC_INTENT_ENTITY,
@@ -477,6 +481,134 @@ async def test_shadow_intelligence_skips_initial_and_reactivation_light_calls(ha
     assert not light_turn_on_calls
     assert switch._intelligence_decisions
     assert switch.adapt_color_switch.is_on is False
+
+
+async def test_shadow_baseline_intercepts_external_turn_on_brightness_only(hass):
+    """The opt-in shadow baseline may enrich, but never originate, turn-on."""
+    await setup_lights(hass)
+    hass.states.async_set("sensor.ambient_recommendation", "3")
+    hass.states.async_set("sensor.semantic_intent", "ambient")
+    hass.states.async_set("binary_sensor.room_occupied", STATE_ON)
+
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_3],
+            CONF_INTERCEPT: True,
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_TRANSITION: 0,
+            CONF_MIN_BRIGHTNESS: 15,
+            CONF_MAX_BRIGHTNESS: 30,
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS: True,
+            CONF_AMBIENT_BRIGHTNESS_ENTITY: "sensor.ambient_recommendation",
+            CONF_SEMANTIC_INTENT_ENTITY: "sensor.semantic_intent",
+            CONF_OCCUPANCY_ENTITIES: ["binary_sensor.room_occupied"],
+        },
+    )
+
+    assert switch._intelligence_shadow_actuation_blocked
+    assert switch._intelligence_shadow_baseline_brightness_active
+    assert not switch._behavior_actuation_enabled()
+    assert hass.states.is_state(ENTITY_LIGHT_3, STATE_OFF)
+
+    prepared_service_calls = []
+    original_prepare = switch.prepare_adaptation_data
+
+    async def track_prepared_call(*args, **kwargs):
+        result = await original_prepare(*args, **kwargs)
+        if result is None:
+            return None
+        original_service_call_datas = result.service_call_datas
+
+        async def track_service_call_datas():
+            async for service_data in original_service_call_datas:
+                prepared_service_calls.append(dict(service_data))
+                yield service_data
+
+        result.service_call_datas = track_service_call_datas()
+        return result
+
+    switch.prepare_adaptation_data = track_prepared_call
+    service_calls = []
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_calls.append)
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ENTITY_LIGHT_3},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    remove_listener()
+
+    state = hass.states.get(ENTITY_LIGHT_3)
+    assert state is not None
+    assert state.state == STATE_ON
+    turn_on_calls = [
+        event
+        for event in service_calls
+        if event.data.get(ATTR_DOMAIN) == LIGHT_DOMAIN
+        and event.data.get(ATTR_SERVICE) == SERVICE_TURN_ON
+    ]
+    assert len(turn_on_calls) == 1
+    assert len(prepared_service_calls) == 1
+    service_data = prepared_service_calls[0]
+    assert service_data[ATTR_BRIGHTNESS] == round(255 * 15 / 100)
+    assert ATTR_COLOR_TEMP_KELVIN not in service_data
+    assert ATTR_RGB_COLOR not in service_data
+
+
+async def test_shadow_baseline_never_powers_on_an_off_light(hass):
+    """Autonomous shadow baseline paths cannot turn on an off fixture."""
+    await setup_lights(hass)
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_3],
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_TRANSITION: 0,
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS: True,
+        },
+    )
+    service_calls = []
+    remove_listener = hass.bus.async_listen(EVENT_CALL_SERVICE, service_calls.append)
+
+    await switch._adapt_light(
+        ENTITY_LIGHT_3,
+        switch.create_context("interval"),
+        transition=0,
+    )
+    await hass.async_block_till_done()
+    remove_listener()
+
+    assert hass.states.is_state(ENTITY_LIGHT_3, STATE_OFF)
+    assert not [
+        event
+        for event in service_calls
+        if event.data.get("domain") == LIGHT_DOMAIN
+        and event.data.get("service") == SERVICE_TURN_ON
+    ]
+
+
+async def test_shadow_baseline_respects_manual_hold_on_external_turn_on(hass):
+    """A whole-light manual hold prevents turn-on brightness enrichment."""
+    await setup_lights(hass)
+    hass.states.async_set("input_boolean.manual_hold", STATE_ON)
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_3],
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS: True,
+            CONF_MANUAL_HOLD_ENTITY: "input_boolean.manual_hold",
+        },
+    )
+
+    assert switch._intelligence_target_brightness(ENTITY_LIGHT_3, 30) is None
 
 
 def async_process_ha_core_config(hass, config):

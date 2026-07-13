@@ -97,6 +97,7 @@ from .const import (
     CONF_ADAPT_ONLY_ON_BARE_TURN_ON,
     CONF_ADAPT_UNTIL_SLEEP,
     CONF_AMBIENT_BRIGHTNESS_CAP,
+    CONF_AMBIENT_BRIGHTNESS_ENTITY,
     CONF_AUTORESET_CONTROL,
     CONF_BRIGHTNESS_MODE,
     CONF_BRIGHTNESS_MODE_TIME_DARK,
@@ -112,6 +113,7 @@ from .const import (
     CONF_INTELLIGENCE_ENABLED,
     CONF_INTELLIGENCE_MINIMUM_CONFIDENCE,
     CONF_INTELLIGENCE_MINIMUM_SAMPLES,
+    CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS,
     CONF_INTELLIGENCE_SHADOW_MODE,
     CONF_INTELLIGENCE_TRAINING_DAYS,
     CONF_INTELLIGENCE_TRAINING_ENABLED,
@@ -493,6 +495,11 @@ def _evaluate_intelligence_policy(
                 "semantic_intent_entity",
                 intent_hint == "ambient",
                 bool(snapshot_values.get("semantic_intent_available", False)),
+            ),
+            ambient_brightness=make_signal(
+                "ambient_brightness_entity",
+                snapshot_values.get("ambient_brightness_value"),
+                bool(snapshot_values.get("ambient_brightness_available", False)),
             ),
             vacant=make_signal(
                 "occupancy_entities",
@@ -1391,6 +1398,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
         self._intelligence_enabled = data[CONF_INTELLIGENCE_ENABLED]
         self._intelligence_shadow_mode = data[CONF_INTELLIGENCE_SHADOW_MODE]
+        self._intelligence_shadow_baseline_brightness = data[
+            CONF_INTELLIGENCE_SHADOW_BASELINE_BRIGHTNESS
+        ]
         self._intelligence_training_config = {
             "enabled": data[CONF_INTELLIGENCE_TRAINING_ENABLED],
             "training_days": data[CONF_INTELLIGENCE_TRAINING_DAYS],
@@ -1410,6 +1420,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             CONF_ENERGY_CONSTRAINT_ENTITY: data[CONF_ENERGY_CONSTRAINT_ENTITY],
             CONF_MANUAL_HOLD_ENTITY: data[CONF_MANUAL_HOLD_ENTITY],
             CONF_SEMANTIC_INTENT_ENTITY: data[CONF_SEMANTIC_INTENT_ENTITY],
+            CONF_AMBIENT_BRIGHTNESS_ENTITY: data[CONF_AMBIENT_BRIGHTNESS_ENTITY],
         }
         self._intelligence_caps = {
             "task": data[CONF_TASK_BRIGHTNESS_CAP],
@@ -1418,6 +1429,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             "night": data[CONF_NIGHT_BRIGHTNESS_CAP],
             "prelight": data[CONF_PRELIGHT_BRIGHTNESS_CAP],
         }
+        self._minimum_brightness = data[CONF_MIN_BRIGHTNESS]
 
         self.initial_transition = data[CONF_INITIAL_TRANSITION]
         self._sleep_transition = data[CONF_SLEEP_TRANSITION]
@@ -1988,8 +2000,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         def latest(states: list[State]) -> State | None:
             return max(
                 states,
-                key=lambda state: timestamp(state)
-                or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+                key=lambda state: (
+                    timestamp(state)
+                    or datetime.datetime.min.replace(tzinfo=dt_util.UTC)
+                ),
                 default=None,
             )
 
@@ -2130,8 +2144,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         def latest(name: str) -> State | None:
             return max(
                 live_states(name),
-                key=lambda state: self._behavior_timestamp(state.last_changed)
-                or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+                key=lambda state: (
+                    self._behavior_timestamp(state.last_changed)
+                    or datetime.datetime.min.replace(tzinfo=dt_util.UTC)
+                ),
                 default=None,
             )
 
@@ -2214,8 +2230,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         ]
         media_state = max(
             active_media,
-            key=lambda state: self._behavior_timestamp(state.last_changed)
-            or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+            key=lambda state: (
+                self._behavior_timestamp(state.last_changed)
+                or datetime.datetime.min.replace(tzinfo=dt_util.UTC)
+            ),
             default=None,
         ) or latest("media")
         media_attributes = self._behavior_attributes(media_state)
@@ -2246,8 +2264,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         weather_state = latest("weather")
         daylight_state = max(
             daylight_states,
-            key=lambda state: self._behavior_timestamp(state.last_changed)
-            or datetime.datetime.min.replace(tzinfo=dt_util.UTC),
+            key=lambda state: (
+                self._behavior_timestamp(state.last_changed)
+                or datetime.datetime.min.replace(tzinfo=dt_util.UTC)
+            ),
             default=None,
         )
         weather_attributes = self._behavior_attributes(weather_state)
@@ -2810,7 +2830,21 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         return self._intelligence_shadow_mode and not auto_promoted
 
-    def _intelligence_snapshot(self) -> dict[str, Any]:
+    @property
+    def _intelligence_shadow_baseline_brightness_active(self) -> bool:
+        """Return whether the opt-in deterministic shadow baseline may run.
+
+        This is intentionally narrower than actuation permission. It may add or
+        update brightness only when an external call is already turning a
+        configured light on, or while that light is already on. It is never
+        consulted by the learned power-state behavior runtime.
+        """
+        return bool(
+            self._intelligence_shadow_actuation_blocked
+            and self._intelligence_shadow_baseline_brightness,
+        )
+
+    def _intelligence_snapshot(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915
         """Build a serializable snapshot for the optional pure policy engine."""
         signals: list[dict[str, Any]] = []
 
@@ -2861,6 +2895,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             CONF_ENERGY_CONSTRAINT_ENTITY: "weather",
             CONF_MANUAL_HOLD_ENTITY: "manual_hold",
             CONF_SEMANTIC_INTENT_ENTITY: "semantic_intent",
+            CONF_AMBIENT_BRIGHTNESS_ENTITY: "ambient_brightness",
         }
         single_states = {
             name: add_signal(
@@ -2877,6 +2912,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 CONF_ENERGY_CONSTRAINT_ENTITY,
                 CONF_MANUAL_HOLD_ENTITY,
                 CONF_SEMANTIC_INTENT_ENTITY,
+                CONF_AMBIENT_BRIGHTNESS_ENTITY,
             )
         }
         semantic_state = single_states[CONF_SEMANTIC_INTENT_ENTITY]
@@ -2933,6 +2969,15 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         sleep_active = _state_is_active(single_states[CONF_SLEEP_ENTITY])
         manual_hold = _state_is_active(single_states[CONF_MANUAL_HOLD_ENTITY])
+        ambient_brightness_state = single_states[CONF_AMBIENT_BRIGHTNESS_ENTITY]
+        try:
+            ambient_brightness_value = (
+                float(ambient_brightness_state.state)
+                if ambient_brightness_state is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            ambient_brightness_value = None
 
         intent_hint = "adaptive"
         semantic_value = semantic_intent or ""
@@ -2981,6 +3026,8 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             "illuminance": [state.state for state in illuminance_states],
             "illuminance_value": illuminance_value,
             "illuminance_available": illuminance_value is not None,
+            "ambient_brightness_value": ambient_brightness_value,
+            "ambient_brightness_available": ambient_brightness_value is not None,
             "home_state": single_states[CONF_HOME_STATE_ENTITY].state
             if single_states[CONF_HOME_STATE_ENTITY] is not None
             else None,
@@ -3070,8 +3117,16 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self,
         light: str,
         baseline_brightness_pct: int,
+        *,
+        external_turn_on: bool = False,
     ) -> dict[str, Any]:
-        """Evaluate one light while preserving manual and turn-on safety boundaries."""
+        """Evaluate one light while preserving manual and turn-on safety boundaries.
+
+        ``external_turn_on`` means Home Assistant is already processing a
+        caller-owned turn-on request. It permits selecting the brightness that
+        is added to that request; it never grants this integration permission
+        to originate the power-state change.
+        """
         snapshot = self._intelligence_snapshot()
         snapshot["manual_control"] = self.manager.get_manual_control_attributes(
             light,
@@ -3091,11 +3146,12 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             and isinstance(light_state.attributes.get(ATTR_BRIGHTNESS), (int, float))
             else baseline_brightness_pct
         )
+        light_available_for_adjustment = is_on(self.hass, light) or external_turn_on
         policy_values = {
             **self._intelligence_caps,
             "baseline_brightness_pct": baseline_brightness_pct,
             "current_brightness_pct": current_brightness,
-            "light_on": is_on(self.hass, light),
+            "light_on": light_available_for_adjustment,
             "manual_hold": snapshot["manual_hold"],
         }
         external = _evaluate_intelligence_policy(
@@ -3156,7 +3212,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             target = fallback["target_brightness_pct"]
         if (
             not decision["can_adjust"]
-            or not is_on(self.hass, light)
+            or not light_available_for_adjustment
             or snapshot["manual_hold"]
         ):
             if decision["intent"] not in {"manual", "manual_hold"}:
@@ -3165,7 +3221,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 "policy did not authorize adjustment; preserving baseline"
                 if not decision["can_adjust"]
                 else "light_not_already_on; automatic turn-on is not implemented"
-                if not is_on(self.hass, light)
+                if not light_available_for_adjustment
                 else "manual hold is authoritative"
             )
         decision["target_brightness_pct"] = target
@@ -3210,13 +3266,34 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         light: str,
         baseline_brightness_pct: int,
     ) -> int | None:
-        """Return an authorized active-mode adjustment, or no brightness call."""
+        """Return an authorized active or opt-in shadow baseline target."""
         if not self._intelligence_enabled:
             return baseline_brightness_pct
-        if self._intelligence_shadow_actuation_blocked:
+        shadow_baseline = self._intelligence_shadow_baseline_brightness_active
+        if self._intelligence_shadow_actuation_blocked and not shadow_baseline:
             return None
-        decision = self._intelligence_decision(light, baseline_brightness_pct)
+        external_turn_on = shadow_baseline and not is_on(self.hass, light)
+        decision = self._intelligence_decision(
+            light,
+            baseline_brightness_pct,
+            external_turn_on=external_turn_on,
+        )
         self._intelligence_decisions[light] = decision
+        target = int(decision["target_brightness_pct"])
+        if shadow_baseline:
+            # The room estimate refines the tanh curve; it does not escape the
+            # configured Adaptive Lighting envelope. This is especially
+            # important on an external turn-on, where an estimate near zero
+            # could otherwise power a dimmable fixture at an unusable level.
+            target = max(
+                round(self._minimum_brightness),
+                min(baseline_brightness_pct, target),
+            )
+        if external_turn_on:
+            # The caller owns the turn-on. We add only a bounded brightness
+            # target to the same request, even though intelligence itself has
+            # no power-state authority in shadow mode.
+            return target if decision["can_adjust"] else None
         permitted = (
             decision["can_adjust"]
             if is_on(self.hass, light)
@@ -3224,7 +3301,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         if not permitted:
             return None
-        return int(decision["target_brightness_pct"])
+        return target
 
     @property
     def icon(self) -> str:
@@ -3275,6 +3352,12 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 "enabled": True,
                 "configured_shadow_mode": self._intelligence_shadow_mode,
                 "shadow_mode": self._intelligence_shadow_actuation_blocked,
+                "shadow_baseline_brightness_configured": (
+                    self._intelligence_shadow_baseline_brightness
+                ),
+                "shadow_baseline_brightness_active": (
+                    self._intelligence_shadow_baseline_brightness_active
+                ),
             }
             extra_state_attributes["intelligence_decisions"] = deepcopy(
                 exposed_decisions,
@@ -3423,6 +3506,11 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             )
         if adapt_color is None:
             adapt_color = LightControlAttributes.COLOR in adaptation_attributes
+        if self._intelligence_shadow_baseline_brightness_active:
+            # Shadow baseline is brightness-only by contract, even if a stale
+            # restored color switch or an explicit service parameter requests
+            # color adaptation.
+            adapt_color = False
         if prefer_rgb_color is None:
             prefer_rgb_color = self._prefer_rgb_color
 
@@ -3508,7 +3596,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             force=force,
         )
 
-    async def _adapt_light(
+    async def _adapt_light(  # noqa: PLR0911
         self,
         light: str,
         context: Context,
@@ -3518,9 +3606,17 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         prefer_rgb_color: bool | None = None,
         force: bool = False,
     ) -> None:
-        if self._intelligence_shadow_actuation_blocked:
+        shadow_baseline = self._intelligence_shadow_baseline_brightness_active
+        if self._intelligence_shadow_actuation_blocked and not shadow_baseline:
             # A commissioned shadow instance may calculate and expose policy
             # decisions, but it must never issue an Adaptive Lighting light call.
+            return
+        if shadow_baseline and not is_on(self.hass, light):
+            # Autonomous interval/reactive paths must never use a brightness
+            # service call to power on an off light. External turn-on requests
+            # use the interceptor path and never reach this branch.
+            return
+        if shadow_baseline and self._intelligence_snapshot()["manual_hold"]:
             return
         if (
             self._intelligence_enabled
@@ -3546,7 +3642,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             light,
             transition,
             adapt_brightness,
-            adapt_color,
+            False if shadow_baseline else adapt_color,
             prefer_rgb_color,
             force,
             context,
@@ -3558,7 +3654,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     async def _execute_adaptation_calls(self, data: AdaptationData) -> None:
         """Executes a sequence of adaptation service calls for the given service datas."""
-        if self._intelligence_shadow_actuation_blocked:
+        if (
+            self._intelligence_shadow_actuation_blocked
+            and not self._intelligence_shadow_baseline_brightness_active
+        ):
             return
         for index in range(data.max_length):
             is_first_call = index == 0
@@ -4191,7 +4290,10 @@ class AdaptiveLightingManager:
                 if (
                     not switch.is_on
                     or not switch._intercept
-                    or switch._intelligence_shadow_actuation_blocked
+                    or (
+                        switch._intelligence_shadow_actuation_blocked
+                        and not switch._intelligence_shadow_baseline_brightness_active
+                    )
                     # Never adapt on light groups, because HA will make a separate light.turn_on
                     or ((e := self.hass.states.get(entity_id)) and _is_light_group(e))
                     # Prevent adaptation of TURN_ON calls when light is already on,
@@ -4420,7 +4522,10 @@ class AdaptiveLightingManager:
             data,
             call.context.id,
         )
-        if switch._intelligence_shadow_actuation_blocked:
+        if (
+            switch._intelligence_shadow_actuation_blocked
+            and not switch._intelligence_shadow_baseline_brightness_active
+        ):
             return
 
         # Reset because turning on the light, this also happens in

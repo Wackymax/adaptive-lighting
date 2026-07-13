@@ -10,6 +10,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 
 from .const import (  # pylint: disable=unused-import
+    CONF_AMBIENT_BRIGHTNESS_ENTITY,
     CONF_ENERGY_CONSTRAINT_ENTITY,
     CONF_HOME_STATE_ENTITY,
     CONF_ILLUMINANCE_ENTITIES,
@@ -190,6 +191,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             CONF_ENERGY_CONSTRAINT_ENTITY,
             CONF_MANUAL_HOLD_ENTITY,
             CONF_SEMANTIC_INTENT_ENTITY,
+            CONF_AMBIENT_BRIGHTNESS_ENTITY,
         ):
             # Optional keys are omitted when unset below. Wrapping a selector
             # in vol.Any(..., None) validates in Python but cannot be serialized

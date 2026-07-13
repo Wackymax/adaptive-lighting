@@ -259,15 +259,21 @@ change_switch_settings:
       selector:
         text: null
     intelligence_enabled:
-      description: Enable additive context-intelligence evaluation.
+      description: Enable context-intelligence target evaluation. It does not turn lights on.
       required: false
       example: false
       selector:
         boolean: null
     intelligence_shadow_mode:
-      description: Compute and expose decisions without any Adaptive Lighting light service calls.
+      description: Compute and expose intelligence decisions without any Adaptive Lighting light service calls.
       required: false
       example: true
+      selector:
+        boolean: null
+    intelligence_shadow_baseline_brightness:
+      description: While intelligence remains in shadow, allow only deterministic Adaptive Lighting brightness adaptation for configured lights that are already on or are being turned on by an external command. This never grants intelligence permission to choose a light's power state or adapt color.
+      required: false
+      example: false
       selector:
         boolean: null
     occupancy_entities:
@@ -331,6 +337,12 @@ change_switch_settings:
       selector:
         entity:
           multiple: false
+    ambient_brightness_entity:
+      description: Entity ID containing a recommended ambient brightness percentage.
+      required: false
+      selector:
+        entity:
+          multiple: false
     task_brightness_cap:
       description: Maximum brightness percentage for task intent.
       required: false
@@ -380,14 +392,14 @@ preview:
   description: Publish a read-only context-intelligence preview event without changing any lights.
   fields:
     entity_id:
-      description: The Adaptive Lighting switch to preview.
+      description: Entity ID of the switch. 📝
       selector:
         entity:
           integration: adaptive_lighting
           domain: switch
           multiple: false
     lights:
-      description: Optional light entity IDs to preview.
+      description: List of light entity_ids to be controlled (may be empty). 🌟
       selector:
         entity:
           domain: light
@@ -396,14 +408,14 @@ explain:
   description: Publish a read-only context-intelligence explanation event without changing any lights.
   fields:
     entity_id:
-      description: The Adaptive Lighting switch to explain.
+      description: Entity ID of the switch. 📝
       selector:
         entity:
           integration: adaptive_lighting
           domain: switch
           multiple: false
     lights:
-      description: Optional light entity IDs to explain.
+      description: List of light entity_ids to be controlled (may be empty). 🌟
       selector:
         entity:
           domain: light

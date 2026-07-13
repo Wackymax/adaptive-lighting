@@ -46,8 +46,10 @@ the model learns the choice without immediately fighting it.
 3. Configure a South Africa holiday-only Workday sensor so public holidays use
    weekend behavior while retaining holiday provenance.
 4. Start a persisted minimum seven-day `shadow_learning` session with
-   auto-promotion enabled. During this phase the behavior executor must make
-   zero light or switch service calls.
+   auto-promotion enabled. During this phase the learned behavior executor must
+   make zero power-state calls. The separately configured deterministic
+   brightness baseline may adjust only an already-on dimmable light or enrich
+   a caller-owned bare turn-on.
 5. Verify the dashboard shows fresh context, discovered candidates, accepted and
    rejected observations, model support/confidence, proposals, corrections,
    suppressions, deadline, and promotion reason.
@@ -71,22 +73,39 @@ continues without fabricating human training samples.
 
 ### Living-room lamp and kitchen cabinet strip
 
-The two dimmable ambient fixtures retain the house's existing sun/cloud/lux
-brightness curve, but only after a person or another explicit routine has
-already turned the fixture on. The versioned
-[`ambient_brightness_when_already_on.yaml`](../examples/toothless/ambient_brightness_when_already_on.yaml)
-Home Assistant blueprint enforces the following invariants:
+The two dimmable ambient fixtures use the fork's native shadow-baseline path.
+The tanh solar trajectory is the normal brightness envelope throughout the
+day, including the evening descent. A room estimate derived from sun, cloud,
+and trustworthy lux may lower that envelope, producing this bounded target:
+
+`target = clamp(room estimate, 15%, current tanh target)`
+
+The native controller enforces the following invariants:
 
 - it never turns either fixture on or off;
-- it runs only in the established evening-dark window while the household is
-  home, Ajax is disarmed, energy safety permits it, and video mode is idle;
-- it uses the existing shared `sensor.living_room_lamp_target_brightness` curve,
-  whose effective ambient range is 15–30%, with a ten-minute transition;
+- a bare Home Assistant turn-on receives the current bounded target in the same
+  operation; a physical turn-on receives it immediately after the state change
+  is observed. Both use a one-second initial hardware transition so the fixture
+  does not linger at its previous level;
+- an explicit scene or command that includes brightness remains authoritative;
+- subsequent curve movement uses 90-second evaluations and 45-second hardware
+  transitions, while the multi-hour tanh function—not those command
+  transitions—defines the perceptual trajectory;
+- a human brightness correction starts a 30-minute attribute-level hold before
+  adaptation resumes;
+- it uses `sensor.living_room_lamp_target_brightness` as the room estimate and
+  enforces a 15–30% usable envelope;
 - the darkness helper combines descending sun elevation, cloud cover, and the
   lowest trustworthy illuminance reading; the kitchen FP300 reading is ignored
   while the kitchen ceiling is on because that fixture contaminates the sensor;
 - because power state never changes, human `on` and `off` actions remain clean
   observations for the learner.
+
+The versioned
+[`ambient_brightness_when_already_on.yaml`](../examples/toothless/ambient_brightness_when_already_on.yaml)
+blueprint is retained as a rollback reference, but must remain disabled while
+the native controller is active so two independent brightness loops cannot
+compete.
 
 ### Garage light
 
@@ -109,8 +128,10 @@ the safe behavior that already works during commissioning.
 
 Release requires the full test suite, static checks, configuration validation,
 a clean restart, no new integration errors, correct live entity classification,
-and a verified zero-call shadow interval. Rollback consists of re-enabling the
-saved lighting automations, disabling intelligence/auto-promotion, restoring the
-backed-up component and configuration, and restarting Home Assistant. Local
-model storage can be retained for diagnosis or deleted explicitly; it never
-contains credentials or raw event objects.
+and a verified zero learned-power-call shadow interval. Expected deterministic
+brightness calls must be attributable only to already-on lights or intercepted
+external turn-ons. Rollback consists of disabling the native shadow baseline,
+re-enabling the saved lighting automations, disabling intelligence/auto-
+promotion, restoring the backed-up component and configuration, and restarting
+Home Assistant. Local model storage can be retained for diagnosis or deleted
+explicitly; it never contains credentials or raw event objects.
