@@ -1,0 +1,109 @@
+blueprint:
+  name: Adaptive Lighting Shower Extractor
+  description: >-
+    Provision a future bathroom extractor from Adaptive Lighting's stable
+    showering signal. The automation keeps extraction running through the
+    detector's recovery phase, applies a hard maximum automatic runtime, and
+    never takes ownership of a fan that was already on manually. Switching an
+    automatically-started extractor off manually immediately relinquishes
+    automation ownership.
+  domain: automation
+  author: Toothless
+  input:
+    showering_sensor:
+      name: Adaptive Lighting showering sensor
+      description: Binary sensor derived from intelligence_environment.
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+    extractor_entity:
+      name: Extractor fan or relay
+      selector:
+        entity:
+          filter:
+            - domain: fan
+            - domain: switch
+    manual_hold_entity:
+      name: Optional manual hold
+      description: Leave empty until a dedicated extractor hold exists.
+      default: ""
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+    run_on_minutes:
+      name: Run-on after recovery
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+          unit_of_measurement: min
+    maximum_runtime_minutes:
+      name: Maximum automatic runtime
+      default: 90
+      selector:
+        number:
+          min: 15
+          max: 180
+          step: 5
+          unit_of_measurement: min
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  extractor_entity: !input extractor_entity
+  manual_hold_entity: !input manual_hold_entity
+  started_by_automation: "{{ not is_state(extractor_entity, 'on') }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input showering_sensor
+    to: "on"
+
+conditions:
+  - condition: template
+    value_template: >-
+      {{ manual_hold_entity == '' or not is_state(manual_hold_entity, 'on') }}
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ started_by_automation }}"
+    then:
+      - action: homeassistant.turn_on
+        target:
+          entity_id: !input extractor_entity
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: !input showering_sensor
+        to: "off"
+      # A manual off is explicit negative feedback: stop this run and do not
+      # later turn off a fan that the resident may have switched back on.
+      - trigger: state
+        entity_id: !input extractor_entity
+        to: "off"
+    timeout:
+      minutes: !input maximum_runtime_minutes
+    continue_on_timeout: true
+  - condition: template
+    value_template: >-
+      {{ started_by_automation and is_state(extractor_entity, 'on') }}
+  # Run-on applies only after a confirmed end of shower/recovery. A timeout is
+  # already the hard safety limit and therefore shuts the extractor off now.
+  - if:
+      - condition: template
+        value_template: "{{ wait.completed }}"
+    then:
+      - delay:
+          minutes: !input run_on_minutes
+  - condition: template
+    value_template: >-
+      {{ is_state(extractor_entity, 'on')
+         and (manual_hold_entity == '' or not is_state(manual_hold_entity, 'on')) }}
+  - action: homeassistant.turn_off
+    target:
+      entity_id: !input extractor_entity

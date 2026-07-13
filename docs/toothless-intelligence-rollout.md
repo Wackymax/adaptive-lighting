@@ -144,6 +144,37 @@ only: it does not control the bathroom light, geyser, or any future extractor
 fan. The week-long observations should be reviewed before shower context is
 allowed to influence any promoted light prediction.
 
+The deployment provisions a stable
+`binary_sensor.main_bathroom_showering` projection from the integration's
+`intelligence_environment` telemetry. It is unavailable while evidence is
+unknown, on for both `active` and `recovering`, and off only after humidity has
+returned near the pre-shower baseline. No extractor entity exists yet, so no
+fan automation is instantiated. When hardware is added, use the reviewed
+[`shower_extractor_from_environment.yaml`](../examples/toothless/shower_extractor_from_environment.yaml)
+blueprint. It will consume this Adaptive Lighting signal, preserve a fan that
+was already on manually, support a dedicated manual hold, run on after
+recovery, and enforce a maximum automatic session.
+
+### Learned-state backup durability
+
+Toothless persists both learning stores in Home Assistant's private
+`/config/.storage` directory:
+
+- `adaptive_lighting_training_toothless_open_plan_intelligence` contains the
+  commissioning phase, preference offsets, accepted/rejected feedback, and
+  pending durability candidates; and
+- `adaptive_lighting_behavior_runtime_toothless_open_plan_intelligence`
+  contains the bounded per-entity temporal on/off models and feedback state.
+
+The deployment gate requires automatic encrypted backups to include the Home
+Assistant configuration and complete to both the local and Home Assistant
+Cloud locations. After any persistence-schema or deployment change, trigger a
+fresh automatic backup and confirm that neither location reports failure. Keep
+the backup emergency kit outside Home Assistant; without its encryption key,
+the off-device copy cannot be restored. Raw environmental sample buffers are
+intentionally absent from backups and start cold after a restart so stale
+humidity cannot actuate a future extractor.
+
 ## Release and rollback gates
 
 Release requires the full test suite, static checks, configuration validation,

@@ -199,6 +199,15 @@ Numeric rise and rate values are diagnostic only. In shadow mode none of these
 features can turn on a light, fan, geyser, or other device, and even after model
 promotion they do not broaden the integration's light-only actuator boundary.
 
+Every derived area result is also published as bounded
+`intelligence_environment` state telemetry. A transition emits
+`adaptive_lighting.environment_changed` with the area, categorical shower
+state, extractor-facing `showering` boolean, and evidence labels. This is the
+stable provisioning seam for ventilation. A future extractor automation may
+consume that signal, but it remains a separately configured actuator with its
+own availability, manual-ownership, run-on, and maximum-runtime safety rules.
+The integration never infers that an arbitrary fan or relay is an extractor.
+
 ### Discovery and reconciliation
 
 The discovery coordinator observes the Home Assistant entity/device registry
@@ -363,6 +372,23 @@ deadline, sample/rejection counts, day-type counts, bounded learner state,
 pending durability candidates, and the last diagnostic sample. It uses
 Home Assistant's private local storage and sends no intelligence data to an
 external service. Raw event objects are not persisted.
+
+Both durable learning layers use Home Assistant's versioned `Store` API and
+therefore live below `/config/.storage`: the preference/training session uses
+`adaptive_lighting_training_<instance>` and the temporal on/off model uses
+`adaptive_lighting_behavior_runtime_<instance>`. Home Assistant configuration
+backups include this directory, so a full backup or a partial backup containing
+the Home Assistant configuration carries model weights, support counters,
+pending durable feedback, rollout phase, and calibration state across a
+restore. The short environmental trend buffer is deliberately rebuilt from
+fresh sensors after restart; it is not learned preference and must never
+restore a stale `showering` decision.
+
+Backup inclusion is a durability boundary, not a reason to duplicate learner
+payloads into entity state attributes. Deployments should keep state telemetry
+compact, verify both private Store files exist, and periodically prove that an
+encrypted off-device backup completes. Restore testing requires the matching
+Home Assistant backup emergency kit.
 
 The online model is intentionally interpretable: bounded local preference
 offsets plus a per-entity online logistic action model with explicit support,

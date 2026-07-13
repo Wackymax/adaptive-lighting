@@ -1798,7 +1798,7 @@ async def test_intelligence_shadow_mode_suppresses_all_light_turn_on_calls(hass)
     events = []
     remove_listener = hass.bus.async_listen(
         EVENT_CALL_SERVICE,
-        lambda event: events.append(event),
+        events.append,
     )
     try:
         await switch._update_attrs_and_maybe_adapt_lights(
@@ -2033,6 +2033,12 @@ async def test_behavior_lifecycle_starts_after_training_and_stops_cleanly(hass):
     )
 
     assert switch._behavior_runtime is not None
+    assert switch._training is not None
+    assert switch._training.storage_key == "adaptive_lighting_training_default"
+    assert (
+        switch._behavior_runtime.storage_key
+        == "adaptive_lighting_behavior_runtime_default"
+    )
     assert switch._behavior_runtime._loaded is True
     assert switch._behavior_runtime_started is True
     behavior = switch.extra_state_attributes["intelligence_behavior"]
@@ -2307,6 +2313,67 @@ async def test_behavior_context_separates_area_activity(
     assert "motion" in area_context["Living"]["event_times"]
     assert "occupancy" in area_context["Office"]["state_dwell"]
     assert all("unbounded" not in value for value in area_context["Living"].values())
+
+
+async def test_behavior_context_derives_area_shower_signal_for_future_extractor(
+    hass,
+    area_registry,
+    entity_registry,
+    freezer,
+):
+    """Humidity ramps become bounded area context and a stable public signal."""
+    freezer.move_to("2026-07-13 06:00:00+00:00")
+    bathroom = area_registry.async_create("Main Bathroom")
+
+    def register(unique_id: str, device_class: str, state: str) -> str:
+        entry = entity_registry.async_get_or_create(
+            "sensor" if device_class in {"humidity", "temperature"} else "binary_sensor",
+            "adaptive_lighting_test",
+            unique_id,
+        )
+        entity_registry.async_update_entity(
+            entry.entity_id,
+            area_id=bathroom.id,
+            device_class=device_class,
+        )
+        hass.states.async_set(entry.entity_id, state, {"device_class": device_class})
+        return entry.entity_id
+
+    humidity = register("bathroom_humidity", "humidity", "68.0")
+    temperature = register("bathroom_temperature", "temperature", "14.0")
+    register("bathroom_occupancy", "occupancy", STATE_ON)
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    events = []
+    hass.bus.async_listen("adaptive_lighting.environment_changed", events.append)
+
+    for minute, humidity_value, temperature_value in (
+        (5, "69.0", "14.1"),
+        (10, "72.0", "14.2"),
+        (15, "78.0", "14.3"),
+    ):
+        freezer.move_to(f"2026-07-13 06:{minute:02d}:00+00:00")
+        hass.states.async_set(humidity, humidity_value, {"device_class": "humidity"})
+        hass.states.async_set(
+            temperature,
+            temperature_value,
+            {"device_class": "temperature"},
+        )
+        context = switch._behavior_context()
+
+    area = context["area_context"]["Main Bathroom"]
+    assert area["categorical_context"]["shower"] == "active"
+    assert area["categorical_context"]["humidity_trend"] == "rising"
+    environment = switch.extra_state_attributes["intelligence_environment"]
+    assert environment["Main Bathroom"]["showering"] is True
+    assert environment["Main Bathroom"]["humidity_rise"] >= 5.0
+    assert events[-1].data["area"] == "Main Bathroom"
+    assert events[-1].data["showering"] is True
 
 
 async def test_behavior_context_separates_weather_daylight_and_solar(
@@ -3092,6 +3159,17 @@ async def test_intelligence_state_attributes_stay_below_recorder_limit(hass):
         }
         for index in range(128)
     }
+    switch._environment_context = {
+        "Main Bathroom": {
+            "shower_state": "active",
+            "showering": True,
+            "observed_at": "2026-07-13T06:15:00+00:00",
+            "humidity_current": 78.0,
+            "humidity_rise": 10.0,
+            "humidity_trend": "rising",
+            "evidence": ["humidity_ramp", "recent_area_activity"],
+        },
+    }
 
     with patch.object(switch, "_behavior_runtime", Mock(diagnostics=behavior)):
         attributes = switch.extra_state_attributes
@@ -3110,6 +3188,7 @@ async def test_intelligence_state_attributes_stay_below_recorder_limit(hass):
     behavior_attributes = attributes["intelligence_behavior"]
     assert len(behavior_attributes["sample_counts"]) == MAX_STATE_SAMPLE_COUNTS
     assert behavior_attributes["sample_counts_truncated"] is True
+    assert attributes["intelligence_environment"]["Main Bathroom"]["showering"]
 
 
 async def test_intelligence_active_mode_preserves_baseline_without_permission(hass):

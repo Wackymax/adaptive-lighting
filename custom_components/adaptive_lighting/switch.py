@@ -192,6 +192,7 @@ from .context_classification import (
     classify_weather_daylight,
 )
 from .discovery import EntityDiscoveryCoordinator, InventorySnapshot
+from .environment import EnvironmentalSample, EnvironmentalSignalTracker
 from .hass_utils import area_entities, setup_service_call_interceptor
 from .helpers import (
     clamp,
@@ -301,6 +302,29 @@ def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
             discovery[key] = list(discovery.get(key, []))[:MAX_STATE_DIAGNOSTIC_ITEMS]
         discovery["truncated"] = True
 
+    environment = attributes.get("intelligence_environment")
+    if isinstance(environment, Mapping):
+        environment_keys = (
+            "shower_state",
+            "showering",
+            "humidity_current",
+            "humidity_rise",
+            "humidity_trend",
+            "temperature_current",
+            "temperature_delta",
+            "temperature_trend",
+            "observed_at",
+        )
+        attributes["intelligence_environment"] = {
+            str(area): {
+                key: value[key]
+                for key in environment_keys
+                if isinstance(value, Mapping) and key in value
+            }
+            for area, value in list(environment.items())[:MAX_STATE_DIAGNOSTIC_ITEMS]
+        }
+        attributes["intelligence_environment_compacted"] = True
+
     if _state_attribute_size(attributes) <= MAX_STATE_ATTRIBUTE_BYTES:
         return attributes
 
@@ -351,6 +375,16 @@ def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
             and (
                 isinstance(value[item], str | bool | int | float) or value[item] is None
             )
+        }
+    environment = attributes.get("intelligence_environment")
+    if isinstance(environment, Mapping):
+        summary["intelligence_environment"] = {
+            str(area): {
+                item: value[item]
+                for item in ("shower_state", "showering", "observed_at")
+                if isinstance(value, Mapping) and item in value
+            }
+            for area, value in list(environment.items())[:MAX_STATE_DIAGNOSTIC_ITEMS]
         }
     return summary
 
@@ -1303,6 +1337,11 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._intelligence_decisions: dict[str, dict[str, Any]] = {}
         self._discovery_snapshot: InventorySnapshot | None = None
         self._discovered_context_entities: dict[str, list[str]] = {}
+        self._environment_tracker = (
+            EnvironmentalSignalTracker() if self._intelligence_enabled else None
+        )
+        self._environment_context: dict[str, dict[str, object]] = {}
+        self._environment_shower_states: dict[str, str] = {}
         self._behavior_runtime: BehaviorRuntimeAdapter | None = None
         self._behavior_runtime_started = False
         self._behavior_evaluate_task: asyncio.Task[None] | None = None
@@ -1536,6 +1575,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             CONF_PRESENCE_ENTITIES: {"presence", "household_presence"},
             "household_presence": {"household_presence"},
             CONF_ILLUMINANCE_ENTITIES: {"illuminance"},
+            "humidity": {"humidity"},
+            "temperature": {"temperature"},
+            "environment": {"environment"},
             CONF_MEDIA_ENTITIES: {"media"},
             "openings": {"opening", "door", "window", "garage_door"},
             "weather": {"weather"},
@@ -1828,6 +1870,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             "source_app",
             "sun_elevation",
             "temperature",
+            "humidity",
             "title",
             "unit_of_measurement",
             "weather_state",
@@ -1969,7 +2012,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         return rank, value
 
-    def _behavior_area_context(
+    def _behavior_area_context(  # noqa: PLR0912, PLR0915 - bounded HA context adapter
         self,
         now: datetime.datetime,
     ) -> dict[str, dict[str, Any]]:
@@ -1982,8 +2025,16 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             "occupancy": {"occupancy"},
             "presence": {"presence", "household_presence"},
             "opening": {"opening", "door", "window", "garage_door"},
+            "humidity": {"humidity"},
+            "temperature": {"temperature"},
         }
+
+        def timestamp(state: State | None) -> datetime.datetime | None:
+            return self._behavior_timestamp(state.last_changed) if state else None
+
         area_entities: dict[str, dict[str, list[str]]] = {}
+        environmental_samples: list[EnvironmentalSample] = []
+        environmental_entity_areas: dict[str, str] = {}
         for item in snapshot.entities:
             area = item.area_name or item.area_id
             if not area:
@@ -1993,9 +2044,27 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                     area_entities.setdefault(area, {}).setdefault(group, []).append(
                         item.entity_id,
                     )
-
-        def timestamp(state: State | None) -> datetime.datetime | None:
-            return self._behavior_timestamp(state.last_changed) if state else None
+            kind = (
+                "humidity"
+                if "humidity" in item.capabilities
+                else "temperature"
+                if "temperature" in item.capabilities
+                else None
+            )
+            if kind is not None:
+                environmental_entity_areas[item.entity_id] = area
+                state = self.hass.states.get(item.entity_id)
+                observed_at = timestamp(state)
+                if self._behavior_state_available(state) and observed_at is not None:
+                    environmental_samples.append(
+                        EnvironmentalSample(
+                            entity_id=item.entity_id,
+                            area=area,
+                            kind=kind,
+                            value=state.state,
+                            observed_at=observed_at,
+                        ),
+                    )
 
         def latest(states: list[State]) -> State | None:
             return max(
@@ -2008,6 +2077,8 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             )
 
         contexts: dict[str, dict[str, Any]] = {}
+        activity_by_area: dict[str, bool | None] = {}
+        opening_by_area: dict[str, bool | None] = {}
         for area in sorted(area_entities)[:128]:
             states_by_group = {
                 group: [
@@ -2038,6 +2109,30 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 )
                 else "empty"
             )
+            activity_states = [
+                *states_by_group.get("motion", []),
+                *occupancy_states,
+                *presence_states,
+            ]
+            activity_by_area[area] = (
+                None
+                if not activity_states
+                else any(
+                    _state_is_active(state)
+                    or (
+                        (changed := timestamp(state)) is not None
+                        and changed <= now
+                        and now - changed <= datetime.timedelta(minutes=15)
+                    )
+                    for state in activity_states
+                )
+            )
+            opening_states = states_by_group.get("opening", [])
+            opening_by_area[area] = (
+                None
+                if not opening_states
+                else any(_state_is_active(state) for state in opening_states)
+            )
             event_times: dict[str, datetime.datetime] = {}
             state_dwell: dict[str, float] = {}
             current_states: dict[str, str] = {}
@@ -2061,6 +2156,53 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                     "opening": current_states.get("opening", "unknown"),
                 },
             }
+
+        if self._environment_tracker is not None:
+            environmental = self._environment_tracker.update(
+                now=now,
+                samples=environmental_samples,
+                current_entity_areas=environmental_entity_areas,
+                area_activity=activity_by_area,
+                area_opening=opening_by_area,
+            )
+            self._environment_context = {
+                area: features.as_dict() for area, features in environmental.items()
+            }
+            current_states = {
+                area: features.shower_state.value
+                for area, features in environmental.items()
+            }
+            for area, features in environmental.items():
+                context = contexts.setdefault(
+                    area,
+                    {
+                        "occupancy": "unknown",
+                        "presence": "unknown",
+                        "event_times": {},
+                        "state_dwell": {},
+                        "categorical_context": {},
+                    },
+                )
+                context["categorical_context"].update(
+                    {
+                        "shower": features.shower_state.value,
+                        "humidity_trend": features.humidity_trend.value,
+                        "temperature_trend": features.temperature_trend.value,
+                    },
+                )
+                previous = self._environment_shower_states.get(area)
+                if previous is not None and previous != features.shower_state.value:
+                    self.hass.bus.async_fire(
+                        f"{DOMAIN}.environment_changed",
+                        {
+                            ATTR_ENTITY_ID: self.entity_id,
+                            "area": area,
+                            "shower_state": features.shower_state.value,
+                            "showering": features.showering,
+                            "evidence": list(features.evidence),
+                        },
+                    )
+            self._environment_shower_states = current_states
         return contexts
 
     def _behavior_context(self) -> Mapping[str, Any]:  # noqa: PLR0912, PLR0915
@@ -3359,6 +3501,17 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                     self._intelligence_shadow_baseline_brightness_active
                 ),
             }
+            environment_items = sorted(
+                self._environment_context.items(),
+                key=lambda item: (
+                    item[1].get("humidity_current") is None,
+                    item[1].get("showering") is not True,
+                    item[0],
+                ),
+            )
+            extra_state_attributes["intelligence_environment"] = deepcopy(
+                dict(environment_items[:MAX_STATE_DIAGNOSTIC_ITEMS]),
+            )
             extra_state_attributes["intelligence_decisions"] = deepcopy(
                 exposed_decisions,
             )

@@ -521,6 +521,10 @@ class BehaviorRuntimeAdapter:
         self.min_effective_support = float(min_effective_support)
         self.min_freshness = float(min_freshness)
 
+        # Persist temporal models below ``/config/.storage`` so Home Assistant
+        # configuration backups carry learned on/off behavior across restores.
+        # ``private=True`` controls local permissions; it does not exclude the
+        # file from an encrypted full/configuration backup.
         self._store: Store[dict[str, Any]] = Store(
             hass,
             STORAGE_VERSION,

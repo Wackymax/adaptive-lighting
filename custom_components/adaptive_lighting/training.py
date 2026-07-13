@@ -426,6 +426,10 @@ class AdaptiveLightingTraining:
         self._now_func = now or dt_util.utcnow
         self._day_type_resolver = day_type_resolver
         self._public_holiday_predicate = public_holiday_predicate
+        # HA Store writes this versioned learner below ``/config/.storage``.
+        # Keeping preference state inside the configuration tree makes it part
+        # of standard Home Assistant configuration backups (including Cloud),
+        # while ``private=True`` protects the local file from broad access.
         self._store: Store[dict[str, Any]] = Store(
             hass,
             STORAGE_VERSION,
