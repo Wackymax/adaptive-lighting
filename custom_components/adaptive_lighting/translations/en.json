@@ -117,6 +117,7 @@
           "autoreset_control_seconds": "Automatically reset the manual control after a number of seconds. Set to 0 to disable. ⏲️",
           "send_split_delay": "Delay (ms) between `separate_turn_on_commands` for lights that don't support simultaneous brightness and color setting. ⏲️",
           "adapt_delay": "Wait time (seconds) between light turn on and Adaptive Lighting applying changes. Might help to avoid flickering. ⏲️",
+          "intelligence_light_min_brightness": "Optional mapping of light entity IDs to intelligence minimum brightness percentages. Configured values apply only to authorized intelligence brightness targets; values must be 1-100 because Home Assistant interprets brightness 0 as power off.",
           "intelligence_training_days": "Days to observe before promotion is evaluated.",
           "intelligence_minimum_samples": "Minimum accepted human preference samples before promotion.",
           "intelligence_minimum_confidence": "Minimum promotion confidence from 0 to 1.",
@@ -326,10 +327,6 @@
         "intelligence_shadow_baseline_brightness": {
           "description": "While intelligence remains in shadow, allow only deterministic Adaptive Lighting brightness adaptation for configured lights that are already on or are being turned on by an external command. This never grants intelligence permission to choose a light's power state or adapt color.",
           "name": "intelligence_shadow_baseline_brightness"
-        },
-        "intelligence_light_min_brightness": {
-          "description": "Optional mapping of light entity IDs to intelligence minimum brightness percentages. Configured values apply only to authorized intelligence brightness targets; values must be 1-100 because Home Assistant interprets brightness 0 as power off.",
-          "name": "intelligence_light_min_brightness"
         },
         "occupancy_entities": {
           "description": "Entity IDs used as occupancy context signals.",
