@@ -3467,7 +3467,6 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             baseline_brightness_pct,
             external_turn_on=external_turn_on,
         )
-        self._intelligence_decisions[light] = decision
         target = int(decision["target_brightness_pct"])
         minimum_brightness = self._intelligence_light_min_brightness.get(light)
         if minimum_brightness is None:
@@ -3477,6 +3476,12 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         # The floor constrains an already-authorized brightness target. It does
         # not create permission to turn a light on or off.
         target = max(minimum_brightness, min(baseline_brightness_pct, target))
+        # Expose the effective fixture-safe target used by adaptation. Keeping
+        # the raw proposal here would make shadow dashboards disagree with the
+        # command that was actually prepared for the light.
+        decision["target_brightness_pct"] = target
+        decision["overridden"] = target != baseline_brightness_pct
+        self._intelligence_decisions[light] = decision
         if external_turn_on:
             # The caller owns the turn-on. We add only a bounded brightness
             # target to the same request, even though intelligence itself has

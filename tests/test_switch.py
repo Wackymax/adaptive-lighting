@@ -618,6 +618,12 @@ async def test_intelligence_light_min_brightness_shadow_override_and_fallback(ha
 
     assert switch._intelligence_target_brightness(ENTITY_LIGHT_1, 3) == 5
     assert switch._intelligence_target_brightness(ENTITY_LIGHT_2, 3) == 15
+    assert switch._intelligence_decisions[ENTITY_LIGHT_1][
+        "target_brightness_pct"
+    ] == 5
+    assert switch._intelligence_decisions[ENTITY_LIGHT_2][
+        "target_brightness_pct"
+    ] == 15
 
 
 async def test_intelligence_light_min_brightness_applies_in_active_phase(hass):
