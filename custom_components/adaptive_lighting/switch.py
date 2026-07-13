@@ -245,6 +245,47 @@ def _state_attribute_size(attributes: Mapping[str, Any]) -> int:
     )
 
 
+def _state_decision_projection(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep explanations useful without copying full signal objects to Recorder."""
+    projection = {
+        key: decision[key]
+        for key in (
+            "intent",
+            "baseline_brightness_pct",
+            "target_brightness_pct",
+            "confidence",
+            "reason",
+            "can_adjust",
+            "can_turn_on",
+            "can_turn_off",
+            "overridden",
+        )
+        if key in decision
+    }
+    provenance = decision.get("provenance")
+    if isinstance(provenance, list | tuple):
+        projection["provenance"] = [
+            {
+                key: item[key]
+                for key in ("name", "source", "confidence")
+                if key in item
+            }
+            for item in provenance[:6]
+            if isinstance(item, Mapping)
+        ]
+    elif isinstance(provenance, Mapping):
+        projection["provenance"] = {
+            key: (
+                list(value[:MAX_STATE_DIAGNOSTIC_ITEMS])
+                if key == "signals" and isinstance(value, list | tuple)
+                else value
+            )
+            for key, value in provenance.items()
+            if key in {"adapter", "signals", "manual_control"}
+        }
+    return projection
+
+
 def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
     attributes: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3489,9 +3530,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         extra_state_attributes.update(self._settings)
         if self._intelligence_enabled:
             decisions = self._intelligence_decisions
-            exposed_decisions = dict(
-                sorted(decisions.items())[:MAX_STATE_INTELLIGENCE_DECISIONS],
-            )
+            exposed_decisions = {
+                entity_id: _state_decision_projection(decision)
+                for entity_id, decision in sorted(decisions.items())[
+                    :MAX_STATE_INTELLIGENCE_DECISIONS
+                ]
+                if isinstance(decision, Mapping)
+            }
             extra_state_attributes["intelligence"] = {
                 "enabled": True,
                 "configured_shadow_mode": self._intelligence_shadow_mode,
