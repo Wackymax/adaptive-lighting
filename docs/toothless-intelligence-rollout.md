@@ -79,7 +79,7 @@ The tanh solar trajectory is the normal brightness envelope throughout the
 day, including the evening descent. A room estimate derived from sun, cloud,
 and trustworthy lux may lower that envelope, producing this bounded target:
 
-`target = clamp(room estimate, 15%, current tanh target)`
+`target = clamp(room estimate, 8%, current tanh target)`
 
 The native controller enforces the following invariants:
 
@@ -95,7 +95,9 @@ The native controller enforces the following invariants:
 - a human brightness correction starts a 30-minute attribute-level hold before
   adaptation resumes;
 - it uses `sensor.living_room_lamp_target_brightness` as the room estimate and
-  enforces a 15–30% usable envelope;
+  enforces an 8–30% usable envelope. Eight percent is the deterministic
+  hardware floor, not a learned preference: manual corrections above it remain
+  authoritative and continue training the contextual model;
 - the darkness helper combines descending sun elevation, cloud cover, and the
   lowest trustworthy illuminance reading; the kitchen FP300 reading is ignored
   while the kitchen ceiling is on because that fixture contaminates the sensor;
