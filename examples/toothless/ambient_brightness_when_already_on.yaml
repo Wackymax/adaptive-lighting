@@ -1,0 +1,92 @@
+blueprint:
+  name: Toothless Ambient Brightness While Already On
+  description: >-
+    Smoothly adapt an already-on ambient light to the house's sun, cloud, and
+    trustworthy illuminance curve. This blueprint deliberately never decides
+    power state: a person or another explicit routine must first turn the light
+    on, and this automation never turns it off. That keeps human on/off choices
+    clean for Adaptive Lighting's shadow learner.
+  domain: automation
+  author: Toothless
+  input:
+    target_light:
+      name: Target light
+      description: Dimmable light whose brightness may be adjusted only while on.
+      selector:
+        entity:
+          domain: light
+    target_available_template:
+      name: Target availability template
+      description: Template that must evaluate true before the target action is run.
+      default: "{{ true }}"
+      selector:
+        text:
+          multiline: true
+    require_video_idle:
+      name: Require video idle
+      description: Prevent the action while living-room video mode is playing or has just stopped.
+      default: false
+      selector:
+        boolean:
+    target_action:
+      name: Target action
+      description: Brightness-only action to run after every safety gate passes.
+      selector:
+        action:
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  target_light: !input target_light
+  require_video_idle: !input require_video_idle
+
+triggers:
+  # Apply the current baseline as soon as a person explicitly turns the light on.
+  - trigger: state
+    entity_id: !input target_light
+    to: "on"
+  - trigger: state
+    entity_id: sensor.living_room_lamp_should_be_on
+    to: "True"
+  - trigger: homeassistant
+    event: start
+  - trigger: event
+    event_type: automation_reloaded
+  # Five-minute updates are frequent enough for the slow solar curve without
+  # repeatedly restarting the ten-minute physical transition every minute.
+  - trigger: time_pattern
+    minutes: /5
+
+conditions:
+  # This is the central invariant: brightness may follow the ambient baseline,
+  # but the baseline is never allowed to choose whether the fixture is on.
+  - condition: template
+    value_template: "{{ is_state(target_light, 'on') }}"
+  - condition: state
+    entity_id: binary_sensor.ajax_disarmed
+    state: "on"
+  - condition: state
+    entity_id: sensor.living_room_lamp_should_be_on
+    state: "True"
+  - condition: template
+    value_template: >-
+      {{ is_state('binary_sensor.household_home_confirmed', 'on')
+         or is_state('binary_sensor.household_arrival_signal', 'on')
+         or is_state('input_boolean.apple_home_occupied', 'on') }}
+  - condition: template
+    value_template: "{{ now().hour >= 12 or now().hour < 4 }}"
+  - condition: template
+    value_template: >-
+      {{ not (is_state('binary_sensor.grid_down', 'on')
+              and is_state('binary_sensor.battery_low', 'on')) }}
+  - condition: template
+    value_template: !input target_available_template
+  - condition: template
+    value_template: >-
+      {{ not require_video_idle
+         or (not is_state('binary_sensor.living_room_video_content_playing', 'on')
+             and (as_timestamp(now())
+                  - as_timestamp(states.binary_sensor.living_room_video_content_playing.last_changed)) >= 60) }}
+
+actions: !input target_action

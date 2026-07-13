@@ -63,6 +63,48 @@ the model learns the choice without immediately fighting it.
    repeated-correction regression returns the affected context to suppression
    or the deployment to shadow.
 
+## Toothless commissioning baselines
+
+Two narrow baselines remain active during the seven-day shadow period. They are
+deliberately kept outside the learned actuator so that useful existing behavior
+continues without fabricating human training samples.
+
+### Living-room lamp and kitchen cabinet strip
+
+The two dimmable ambient fixtures retain the house's existing sun/cloud/lux
+brightness curve, but only after a person or another explicit routine has
+already turned the fixture on. The versioned
+[`ambient_brightness_when_already_on.yaml`](../examples/toothless/ambient_brightness_when_already_on.yaml)
+Home Assistant blueprint enforces the following invariants:
+
+- it never turns either fixture on or off;
+- it runs only in the established evening-dark window while the household is
+  home, Ajax is disarmed, energy safety permits it, and video mode is idle;
+- it uses the existing shared `sensor.living_room_lamp_target_brightness` curve,
+  whose effective ambient range is 15–30%, with a ten-minute transition;
+- the darkness helper combines descending sun elevation, cloud cover, and the
+  lowest trustworthy illuminance reading; the kitchen FP300 reading is ignored
+  while the kitchen ceiling is on because that fixture contaminates the sensor;
+- because power state never changes, human `on` and `off` actions remain clean
+  observations for the learner.
+
+### Garage light
+
+The existing garage automations remain the operational prior while the model is
+in shadow. Door movement or reliable occupancy turns the on/off-only garage
+light on; occupancy clear starts a bounded hold; expiry may turn it off only
+when the garage is closed, occupancy is clear, and no manual hold exists. A
+separate invariant keeps the light on while the garage door is open and keeps
+the detached wall-switch relay powered.
+
+The whole-house discovery layer independently includes `light.garage_light`
+and the garage opening/occupancy entities in its behavior context. It does not
+treat the garage cover as an actuator. Attributable human changes and overrides
+are learned continuously, including the day type and time horizons in effect;
+automation-originated state changes do not masquerade as human preference. This
+lets the learned policy eventually refine the operational prior without losing
+the safe behavior that already works during commissioning.
+
 ## Release and rollback gates
 
 Release requires the full test suite, static checks, configuration validation,
