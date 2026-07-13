@@ -23,6 +23,7 @@ from homeassistant.components.light import (
     ATTR_SUPPORTED_COLOR_MODES,
     ColorMode,
 )
+from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_FRIENDLY_NAME,
@@ -63,6 +64,9 @@ _CONTEXT_CAPABILITIES = frozenset(
         "window",
         "garage_door",
         "illuminance",
+        "temperature",
+        "humidity",
+        "environment",
         "media",
         "security",
         "holiday_calendar",
@@ -316,6 +320,10 @@ def classify_entity(  # noqa: PLR0912,PLR0915 - one auditable branch per HA doma
         ) or entry.unit_of_measurement
         if device_class == "illuminance" or str(unit).lower() in {"lx", "lux"}:
             capabilities.extend(("illuminance", "context"))
+        if device_class == SensorDeviceClass.TEMPERATURE.value:
+            capabilities.extend(("temperature", "environment", "context"))
+        elif device_class == SensorDeviceClass.HUMIDITY.value:
+            capabilities.extend(("humidity", "environment", "context"))
         sensor_name = " ".join(
             value
             for value in (entry.entity_id, entry.name, entry.original_name)

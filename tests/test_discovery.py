@@ -130,6 +130,20 @@ async def test_classification_uses_vendored_ha_capabilities(
         area_id=area.id,
         device_class="illuminance",
     )
+    temperature = _entity(
+        entity_registry,
+        "sensor",
+        "temperature",
+        area_id=area.id,
+        device_class="temperature",
+    )
+    humidity = _entity(
+        entity_registry,
+        "sensor",
+        "humidity",
+        area_id=area.id,
+        device_class="humidity",
+    )
     media = _entity(
         entity_registry,
         "media_player",
@@ -156,6 +170,8 @@ async def test_classification_uses_vendored_ha_capabilities(
         hass.states.async_set(entry.entity_id, "off")
     hass.states.async_set(garage.entity_id, "closed")
     hass.states.async_set(illuminance.entity_id, "120")
+    hass.states.async_set(temperature.entity_id, "21.5")
+    hass.states.async_set(humidity.entity_id, "58.0")
     hass.states.async_set(media.entity_id, "idle")
     hass.states.async_set(
         holiday.entity_id,
@@ -209,6 +225,18 @@ async def test_classification_uses_vendored_ha_capabilities(
             hass.states.get(illuminance.entity_id),
         ).capabilities,
     )
+    assert {"temperature", "environment", "context"}.issubset(
+        classify_entity(
+            temperature,
+            hass.states.get(temperature.entity_id),
+        ).capabilities,
+    )
+    assert {"humidity", "environment", "context"}.issubset(
+        classify_entity(
+            humidity,
+            hass.states.get(humidity.entity_id),
+        ).capabilities,
+    )
     assert {"media", "context"}.issubset(
         classify_entity(media, hass.states.get(media.entity_id)).capabilities,
     )
@@ -240,6 +268,8 @@ async def test_classification_uses_vendored_ha_capabilities(
                 opening,
                 garage,
                 illuminance,
+                temperature,
+                humidity,
                 media,
                 holiday,
                 holiday_sensor,

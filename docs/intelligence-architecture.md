@@ -86,7 +86,7 @@ single threshold as a household rule:
 | Calendar | Weekday, weekend, and public holiday | Public holidays retain their provenance but intentionally use weekend behavior. |
 | Event recency and dwell | Time since motion, opening, arrival, media, or a prior light action; how long a state persists | Separate a current event from stale residue and a durable preference. |
 | Household state | Home/away and recent arrival | Permit a low, bounded welcome or handoff context only when the evidence is fresh. |
-| Environment | Weather, daylight/sun position, illuminance, and a solar/PV proxy | Estimate ambient conditions and confidence; ordinary lux remains photopic context, not melanopic exposure. |
+| Environment | Weather, daylight/sun position, illuminance, solar/PV, temperature, humidity, and derived room trends | Estimate ambient conditions and activity context; ordinary lux remains photopic context, not melanopic exposure. |
 | Activity | Media category and application, semantic intent, openings, motion, and presence | Distinguish video, music, task, ambient, and movement through a space. |
 
 Room-local evidence is kept separate from house-wide evidence. Motion,
@@ -175,6 +175,29 @@ near a light.
 When context is incomplete, the safe result is an explicit `unknown` or a
 no-op. A missing sensor must not be converted into “the room is empty” or
 “the light should turn on”.
+
+### Environmental activity inference
+
+Native temperature and relative-humidity sensors are discovered as area-scoped
+context automatically. Their raw state is never an actuator permission. The
+integration keeps only a bounded in-memory signal window per entity and derives
+coarse room-local trends for the online behavior model. Moving or removing a
+sensor reconciles that window immediately, so observations cannot leak into the
+wrong room.
+
+Shower context is deliberately a correlated event, not a humidistat rule. A
+high absolute relative humidity can be normal weather or a persistent building
+condition. The detector therefore requires a sufficiently long, finite sample
+window and a rapid humidity rise, then seeks corroboration from a temperature
+rise or recent activity in the same area. It uses hysteresis during recovery so
+one noisy sample cannot make the context oscillate. Missing evidence produces
+`unknown`; high-but-flat humidity produces `clear`.
+
+The derived `shower`, `humidity_trend`, and `temperature_trend` categories may
+help a room's light model distinguish a shower from a brief bathroom visit.
+Numeric rise and rate values are diagnostic only. In shadow mode none of these
+features can turn on a light, fan, geyser, or other device, and even after model
+promotion they do not broaden the integration's light-only actuator boundary.
 
 ### Discovery and reconciliation
 
@@ -544,12 +567,23 @@ three reasons:
   automated result. That supports decision reasons, confidence, rejected
   alternatives, and quick manual reversal as visible feedback: [Explainable
   Activity Recognition for Smart Home Systems (Das et al., 2023)](https://doi.org/10.1145/3561533).
+- Najeh, Lohr, and Leduc use dynamic temporal windows, sensor correlation, and
+  trigger-sensor identity for streaming smart-home activity recognition. The
+  open-access full text supports treating a humidity ramp as a trigger inside
+  a correlated room-local event window rather than as an isolated threshold:
+  [Dynamic Segmentation of Sensor Events for Real-Time Human Activity
+  Recognition in a Smart Home Context (Najeh et al., 2022)](https://doi.org/10.3390/s22145458).
+- Guyot, Sherman, and Walker review residential smart ventilation studies that
+  use humidity, occupancy, outdoor temperature, and combined signals. This
+  metadata/abstract-level evidence supports humidity as useful demand context,
+  while the Toothless detector's thresholds remain locally calibrated rather
+  than claimed as universal: [Smart ventilation energy and indoor air quality
+  performance in residential buildings (Guyot et al., 2018)](https://doi.org/10.1016/j.enbuild.2017.12.051).
 
-These references are primary-paper DOI/metadata and abstract-level rationale
-for this rollout. This document does not claim a full-text review of any paper
-unless the full text was directly available and read; the references are not
-evidence that this implementation reproduces their datasets, models, or
-reported results.
+These references are primary-paper evidence or DOI/abstract-level rationale as
+labelled above. Najeh et al.'s open-access full text was read for the streaming
+segmentation design; the other references do not imply that this implementation
+reproduces their datasets, models, or reported results.
 
 ## Related documentation
 

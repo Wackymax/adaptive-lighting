@@ -15,7 +15,8 @@ The system learns attributable human `on` and `off` actions for each light-like
 entity and room. It also learns explicit Good Night actions. It continuously
 combines multiple time horizons with occupancy, presence, openings, arrival,
 home/away, weekday/weekend/public-holiday state, media type and app, weather,
-sun/daylight, illuminance, solar/energy, and alarm state.
+sun/daylight, illuminance, solar/energy, temperature, humidity, derived shower
+context, and alarm state.
 
 A quick human reversal after an automatic action is strong negative feedback.
 An unchanged automatic action becomes only weak positive evidence after its
@@ -123,6 +124,25 @@ are learned continuously, including the day type and time horizons in effect;
 automation-originated state changes do not masquerade as human preference. This
 lets the learned policy eventually refine the operational prior without losing
 the safe behavior that already works during commissioning.
+
+### Main-bathroom environmental context
+
+`sensor.bathroom_humidity_temp_humidity` and
+`sensor.bathroom_humidity_temp_temperature` are assigned to Main Bathroom with
+the room's occupancy and window sensors. A seven-day recorder sample showed
+that likely showers repeatedly produced a roughly 5–12 percentage-point
+humidity rise within 15 minutes, usually with a 0.5–2.0 °C temperature rise and
+recent room activity. Baseline humidity also exceeded 80%, proving that a fixed
+absolute humidity threshold would be unsafe for this house.
+
+The live prior is therefore a bounded derivative detector with correlated
+evidence and hysteresis. It auto-discovers native humidity and temperature
+sensors, keeps their evidence area-local, and reconciles additions, removals,
+renames, and area moves. The dashboard exposes current trends, evidence, and
+the derived shower state. During commissioning this state is learning context
+only: it does not control the bathroom light, geyser, or any future extractor
+fan. The week-long observations should be reviewed before shower context is
+allowed to influence any promoted light prediction.
 
 ## Release and rollback gates
 
