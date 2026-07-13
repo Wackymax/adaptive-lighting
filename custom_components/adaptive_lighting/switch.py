@@ -232,6 +232,7 @@ _LOGGER = logging.getLogger(__name__)
 # rejects attributes larger than 16 KiB and would otherwise log on every update
 # in a large Home Assistant installation.
 MAX_STATE_DIAGNOSTIC_ITEMS = 8
+MAX_STATE_ENVIRONMENT_AREAS = 4
 MAX_STATE_INTELLIGENCE_DECISIONS = 8
 MAX_STATE_SAMPLE_COUNTS = 32
 MAX_STATE_ATTRIBUTE_BYTES = 14_000
@@ -258,8 +259,9 @@ def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
         return attributes
 
     attributes["state_attributes_truncated"] = True
-    attributes["configuration"] = {}
-    attributes["configuration_truncated"] = True
+    if attributes.get("configuration"):
+        attributes["configuration"] = {}
+        attributes["configuration_truncated"] = True
     for key in ("manual_control",):
         value = attributes.get(key)
         if isinstance(value, list):
@@ -3501,16 +3503,26 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                     self._intelligence_shadow_baseline_brightness_active
                 ),
             }
+            # Temperature-only rooms remain available to the in-memory learner,
+            # but shower telemetry is useful only where humidity exists (or an
+            # already-active shower must remain visible). Keeping that
+            # distinction out of entity attributes avoids Recorder budget
+            # warnings in houses with many temperature sensors.
+            exposed_environment = (
+                (area, values)
+                for area, values in self._environment_context.items()
+                if values.get("humidity_current") is not None
+                or values.get("showering") is True
+            )
             environment_items = sorted(
-                self._environment_context.items(),
+                exposed_environment,
                 key=lambda item: (
-                    item[1].get("humidity_current") is None,
                     item[1].get("showering") is not True,
                     item[0],
                 ),
             )
             extra_state_attributes["intelligence_environment"] = deepcopy(
-                dict(environment_items[:MAX_STATE_DIAGNOSTIC_ITEMS]),
+                dict(environment_items[:MAX_STATE_ENVIRONMENT_AREAS]),
             )
             extra_state_attributes["intelligence_decisions"] = deepcopy(
                 exposed_decisions,

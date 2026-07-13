@@ -2369,7 +2369,10 @@ async def test_behavior_context_derives_area_shower_signal_for_future_extractor(
     area = context["area_context"]["Main Bathroom"]
     assert area["categorical_context"]["shower"] == "active"
     assert area["categorical_context"]["humidity_trend"] == "rising"
-    environment = switch.extra_state_attributes["intelligence_environment"]
+    attributes = switch.extra_state_attributes
+    assert "state_attributes_truncated" not in attributes
+    environment = attributes["intelligence_environment"]
+    assert set(environment) == {"Main Bathroom"}
     assert environment["Main Bathroom"]["showering"] is True
     assert environment["Main Bathroom"]["humidity_rise"] >= 5.0
     assert events[-1].data["area"] == "Main Bathroom"
