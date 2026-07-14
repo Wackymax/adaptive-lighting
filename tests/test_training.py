@@ -1,9 +1,11 @@
 """Focused tests for the local Home Assistant training session."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from homeassistant.components.adaptive_lighting import training as training_module
 from homeassistant.components.adaptive_lighting.training import (
     DAY_TYPE_PUBLIC_HOLIDAY,
     DAY_TYPE_WEEKDAY,
@@ -41,6 +43,32 @@ async def make_training(hass, **kwargs: object) -> AdaptiveLightingTraining:
     )
     await training.async_setup()
     return training
+
+
+def patch_scheduler(monkeypatch):
+    """Capture the callbacks registered with HA's point-in-time helper."""
+    scheduled: list[tuple[Callable[[datetime], object], datetime]] = []
+    cancelled: set[int] = set()
+
+    def track_point_in_time(
+        _hass: object,
+        callback: Callable[[datetime], object],
+        point_in_time: datetime,
+    ) -> Callable[[], None]:
+        entry_number = len(scheduled)
+        scheduled.append((callback, point_in_time))
+
+        def cancel() -> None:
+            cancelled.add(entry_number)
+
+        return cancel
+
+    monkeypatch.setattr(
+        training_module,
+        "async_track_point_in_utc_time",
+        track_point_in_time,
+    )
+    return scheduled, cancelled
 
 
 async def test_persistence_roundtrip_keeps_session_and_learner(hass) -> None:
@@ -226,6 +254,147 @@ async def test_durability_waits_and_new_override_supersedes_old(hass) -> None:
     await training.async_unload()
 
 
+async def test_scheduled_durability_callback_accepts_once(hass, monkeypatch) -> None:
+    """The real scheduled callback bridge queues one durable acceptance."""
+    scheduled, _cancelled = patch_scheduler(monkeypatch)
+    current = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    clock = [current]
+    training = await make_training(
+        hass,
+        durability_seconds=10,
+        now=lambda: clock[0],
+    )
+
+    assert await training.async_ingest_sample(candidate())
+    accept_at = current + timedelta(seconds=10)
+    callbacks = [callback for callback, point in scheduled if point == accept_at]
+    assert len(callbacks) == 1
+
+    clock[0] = accept_at
+    callback = callbacks[0]
+    assert callback(accept_at) is None
+    assert callback(accept_at) is None
+    await hass.async_block_till_done()
+
+    assert training.sample_count == 1
+    assert training.learner.sample_count == 1
+    assert training.pending_count == 0
+    assert training._pending_timers == {}
+
+    await training.async_unload()
+
+
+async def test_scheduled_deadline_callback_is_sync(hass, monkeypatch) -> None:
+    """The deadline callback also schedules its coroutine without returning it."""
+    scheduled, _cancelled = patch_scheduler(monkeypatch)
+    current = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    clock = [current]
+    training = await make_training(
+        hass,
+        auto_promote=True,
+        now=lambda: clock[0],
+    )
+    deadline = training.deadline
+    assert deadline is not None
+    callbacks = [callback for callback, point in scheduled if point == deadline]
+    assert len(callbacks) == 1
+
+    clock[0] = deadline
+    assert callbacks[0](deadline) is None
+    await hass.async_block_till_done()
+
+    assert training.phase == PHASE_SHADOW_LEARNING
+    assert "insufficient_samples" in training.summary()["promotion_reason"]
+
+    await training.async_unload()
+
+
+async def test_restored_pending_callback_accepts_once(hass, monkeypatch) -> None:
+    """A pending sample restored before its due time uses the scheduler path."""
+    scheduled, cancelled = patch_scheduler(monkeypatch)
+    current = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    clock = [current]
+    training = await make_training(
+        hass,
+        durability_seconds=10,
+        now=lambda: clock[0],
+    )
+    assert await training.async_ingest_sample(candidate())
+    accept_at = current + timedelta(seconds=10)
+    storage_key = training.storage_key
+    await training.async_unload()
+
+    clock[0] = accept_at - timedelta(seconds=1)
+    restored = AdaptiveLightingTraining(
+        hass,
+        storage_key=storage_key,
+        durability_seconds=10,
+        now=lambda: clock[0],
+    )
+    await restored.async_setup()
+    callbacks = [
+        callback
+        for index, (callback, point) in enumerate(scheduled)
+        if point == accept_at and index not in cancelled
+    ]
+    assert len(callbacks) == 1
+
+    clock[0] = accept_at
+    assert callbacks[0](accept_at) is None
+    assert callbacks[0](accept_at) is None
+    await hass.async_block_till_done()
+
+    assert restored.sample_count == 1
+    assert restored.learner.sample_count == 1
+    assert restored.pending_count == 0
+
+    await restored.async_unload()
+
+
+async def test_due_pending_restored_from_storage_is_processed_once(
+    hass,
+    monkeypatch,
+) -> None:
+    """A sample already due on restart is queued once and not double-counted."""
+    _scheduled, _cancelled = patch_scheduler(monkeypatch)
+    current = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    clock = [current]
+    training = await make_training(
+        hass,
+        durability_seconds=10,
+        now=lambda: clock[0],
+    )
+    assert await training.async_ingest_sample(candidate())
+    accept_at = current + timedelta(seconds=10)
+    storage_key = training.storage_key
+    await training.async_unload()
+
+    clock[0] = accept_at + timedelta(seconds=1)
+    restored = AdaptiveLightingTraining(
+        hass,
+        storage_key=storage_key,
+        durability_seconds=10,
+        now=lambda: clock[0],
+    )
+    await restored.async_setup()
+    restored._schedule_pending()
+    restored._schedule_pending()
+    await hass.async_block_till_done()
+
+    assert restored.sample_count == 1
+    assert restored.learner.sample_count == 1
+    assert restored.pending_count == 0
+    stored = await restored._store.async_load()
+    assert stored is not None
+    assert stored["pending"] == []
+
+    await restored.async_process_due(now=clock[0])
+    assert restored.sample_count == 1
+    assert restored.learner.sample_count == 1
+
+    await restored.async_unload()
+
+
 async def test_unload_cancels_deadline_and_durability_callbacks(hass) -> None:
     """Unload removes all scheduled callbacks while preserving local data."""
     training = await make_training(hass, durability_seconds=3600)
@@ -289,6 +458,22 @@ async def test_reset_starts_a_new_shadow_session(hass) -> None:
     assert training.learner.export_state()["entries"] == []
 
     await training.async_unload()
+
+
+async def test_reset_after_unload_does_not_mutate_or_report_false_success(hass) -> None:
+    """An entity-removal race cannot reset only the dead in-memory manager."""
+    training = await make_training(hass, durability_seconds=0)
+    assert await training.async_ingest_sample(candidate())
+    before = training.export_state()
+
+    await training.async_unload()
+    summary = await training.async_reset(
+        now=training.training_started_at + timedelta(days=1),
+    )
+
+    assert training.export_state() == before
+    assert summary["sample_counts"]["accepted"] == 1
+    assert training._deadline_timer is None
 
 
 async def test_listener_receives_learning_and_phase_changes(hass) -> None:

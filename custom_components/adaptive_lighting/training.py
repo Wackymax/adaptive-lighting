@@ -15,8 +15,9 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
@@ -453,11 +454,17 @@ class AdaptiveLightingTraining:
         self._day_type_counts: dict[str, int] = {}
         self._pending: dict[str, dict[str, Any]] = {}
         self._pending_timers: dict[str, Callable[[], None]] = {}
+        self._pending_accepting: set[int] = set()
         self._deadline_timer: Callable[[], None] | None = None
+        self._deadline_generation = 0
+        self._deadline_task: asyncio.Task[Any] | None = None
+        self._managed_tasks: set[asyncio.Task[Any]] = set()
         self._listeners: set[Callable[[dict[str, Any]], Any]] = set()
         self._sequence = 0
         self._loaded = False
         self._unloaded = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._persist_lock = asyncio.Lock()
         if on_change is not None:
             self._listeners.add(on_change)
 
@@ -603,42 +610,46 @@ class AdaptiveLightingTraining:
 
     async def async_setup(self) -> AdaptiveLightingTraining:
         """Load state, start a new session if needed, and restore timers."""
-        if self._loaded:
-            return self
-        stored = await self._store.async_load()
-        if stored is None:
-            self._start_new_session(self._current_time())
-            self._loaded = True
-            await self._persist()
-        else:
-            self._restore(stored)
-            self._loaded = True
-            if self._training_deadline is None:
+        async with self._lifecycle_lock:
+            if self._loaded or self._unloaded:
+                return self
+            stored = await self._store.async_load()
+            if stored is None:
                 self._start_new_session(self._current_time())
+                self._loaded = True
                 await self._persist()
-            elif (
-                self._phase == PHASE_SHADOW_LEARNING
-                and self._current_time() >= self._training_deadline
-            ):
-                await self.async_evaluate_promotion(now=self._current_time())
-        self._schedule_deadline()
-        self._schedule_pending()
-        return self
+            else:
+                self._restore(stored)
+                self._loaded = True
+                if self._training_deadline is None:
+                    self._start_new_session(self._current_time())
+                    await self._persist()
+                elif (
+                    self._phase == PHASE_SHADOW_LEARNING
+                    and self._current_time() >= self._training_deadline
+                ):
+                    await self.async_evaluate_promotion(now=self._current_time())
+            self._schedule_deadline()
+            self._schedule_pending()
+            return self
 
     async_initialize = async_setup
     async_load = async_setup
 
     async def async_unload(self) -> None:
         """Cancel all timers/listeners while preserving durable session state."""
-        if self._unloaded:
-            return
-        self._cancel_timers()
-        # State changes have already been written synchronously by each public
-        # operation.  A final save covers a caller unloading immediately after
-        # a read/restart operation without deleting the training record.
-        if self._loaded:
-            await self._persist()
-        self._unloaded = True
+        async with self._lifecycle_lock:
+            if self._unloaded:
+                return
+            self._unloaded = True
+            self._cancel_timers()
+            await self._cancel_managed_tasks()
+            # State changes have already been written synchronously by each
+            # public operation. A final save covers a caller unloading
+            # immediately after a read/restart operation without deleting the
+            # training record.
+            if self._loaded:
+                await self._persist(force=True)
 
     async_stop = async_unload
 
@@ -941,55 +952,132 @@ class AdaptiveLightingTraining:
             self.day_type_counts,
         )
 
-    async def _persist(self) -> None:
+    async def _persist(self, *, force: bool = False) -> None:
         """Write only JSON-safe data through HA's local Store."""
-        await self._store.async_save(self.export_state())
+        async with self._persist_lock:
+            if self._unloaded and not force:
+                return
+            await self._store.async_save(self.export_state())
 
     async def _persist_and_notify(self, before: tuple[Any, ...]) -> None:
         """Persist and notify listeners after a meaningful state change."""
+        if self._unloaded:
+            return
         await self._persist()
-        if before != self._state_signature():
+        if not self._unloaded and before != self._state_signature():
             self._notify()
 
     def _notify(self) -> None:
         """Publish a compact snapshot without allowing one listener to break HA."""
+        if self._unloaded:
+            return
         snapshot = self.summary()
         for listener in tuple(self._listeners):
+            if self._unloaded:
+                return
             try:
                 result = listener(snapshot)
                 if asyncio.iscoroutine(result):
-                    self.hass.async_create_task(result)
+                    self._create_managed_task(result)
             except Exception:
                 _LOGGER.exception("Adaptive Lighting training listener failed")
 
+    def _create_managed_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+    ) -> asyncio.Task[Any] | None:
+        """Create and retain a task until it has finished or been canceled."""
+        if self._unloaded:
+            coroutine.close()
+            return None
+        task = self.hass.async_create_task(coroutine)
+        self._managed_tasks.add(task)
+        task.add_done_callback(self._managed_tasks.discard)
+        return task
+
+    async def _cancel_managed_tasks(self) -> None:
+        """Cancel owned work, excluding the task currently running unload."""
+        current = asyncio.current_task()
+        tasks = tuple(task for task in self._managed_tasks if task is not current)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._managed_tasks.difference_update(tasks)
+
     def _schedule_deadline(self) -> None:
         """Schedule the persisted deadline using HA's cancellable time helper."""
+        if self._deadline_task is not None and self._deadline_task.done():
+            self._deadline_task = None
         if (
             self._unloaded
             or self._deadline_timer is not None
+            or self._deadline_task is not None
             or self._phase != PHASE_SHADOW_LEARNING
             or self._training_deadline is None
         ):
             return
-        if self._current_time() >= self._training_deadline:
-            self.hass.async_create_task(self.async_evaluate_promotion())
+        current = self._current_time()
+        self._deadline_generation += 1
+        generation = self._deadline_generation
+        if current >= self._training_deadline:
+            self._start_deadline_task(generation, current)
             return
         self._deadline_timer = async_track_point_in_utc_time(
             self.hass,
-            self._async_deadline_reached,
+            partial(self._deadline_timer_reached, generation),
             self._training_deadline,
         )
 
     def _cancel_deadline_timer(self) -> None:
         """Cancel only the phase deadline, leaving durable samples queued."""
+        self._deadline_generation += 1
         if self._deadline_timer is not None:
             self._deadline_timer()
             self._deadline_timer = None
+        current = asyncio.current_task()
+        if self._deadline_task is not None and self._deadline_task is not current:
+            self._deadline_task.cancel()
+            self._deadline_task = None
 
-    async def _async_deadline_reached(self, _when: datetime) -> None:
+    async def _async_deadline_reached(
+        self,
+        generation: int,
+        _when: datetime,
+    ) -> None:
         """Evaluate gates once the persisted deadline is reached."""
+        if self._unloaded or generation != self._deadline_generation:
+            return
         self._deadline_timer = None
         await self.async_evaluate_promotion(now=self._current_time())
+
+    def _deadline_timer_reached(
+        self,
+        generation: int,
+        when: datetime,
+    ) -> None:
+        """Bridge HA's synchronous timer callback to the async evaluator."""
+        if self._unloaded or generation != self._deadline_generation:
+            return
+        self._deadline_timer = None
+        self._start_deadline_task(generation, when)
+
+    def _start_deadline_task(self, generation: int, when: datetime) -> None:
+        """Own one deadline evaluation task for the current generation."""
+        if self._deadline_task is not None:
+            return
+        task = self._create_managed_task(
+            self._async_deadline_reached(generation, when),
+        )
+        if task is None:
+            return
+        self._deadline_task = task
+        task.add_done_callback(self._deadline_task_done)
+
+    def _deadline_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Clear the task slot without touching a newer generation."""
+        if self._deadline_task is task:
+            self._deadline_task = None
 
     def _schedule_pending(self) -> None:
         """Restore durability timers after a Home Assistant restart."""
@@ -1000,30 +1088,76 @@ class AdaptiveLightingTraining:
                 continue
             accept_at = item["accept_at"]
             if self._current_time() >= accept_at:
-                self.hass.async_create_task(self._async_accept_pending(candidate_id))
+                self._queue_pending_acceptance(candidate_id, item)
                 continue
             self._pending_timers[candidate_id] = async_track_point_in_utc_time(
                 self.hass,
-                lambda _when, item_id=candidate_id: self._async_pending_reached(
-                    item_id,
+                partial(
+                    self._pending_timer_reached,
+                    candidate_id,
+                    item,
                 ),
                 accept_at,
             )
 
-    async def _async_pending_reached(self, candidate_id: str) -> None:
-        """Accept a candidate only after its durability timer fires."""
+    def _pending_timer_reached(
+        self,
+        candidate_id: str,
+        item: Mapping[str, Any],
+        _when: datetime,
+    ) -> None:
+        """Bridge a durability timer to an async, identity-checked task."""
+        if self._unloaded or self._pending.get(candidate_id) is not item:
+            return
         self._pending_timers.pop(candidate_id, None)
-        await self._async_accept_pending(candidate_id)
+        self._queue_pending_acceptance(candidate_id, item)
+
+    def _queue_pending_acceptance(
+        self,
+        candidate_id: str,
+        item: Mapping[str, Any],
+    ) -> None:
+        """Queue one acceptance task for one in-memory pending record."""
+        if self._unloaded or self._pending.get(candidate_id) is not item:
+            return
+        item_token = id(item)
+        if item_token in self._pending_accepting:
+            return
+        self._pending_accepting.add(item_token)
+        self._create_managed_task(
+            self._async_accept_pending_once(candidate_id, item, item_token),
+        )
+
+    async def _async_accept_pending_once(
+        self,
+        candidate_id: str,
+        item: Mapping[str, Any],
+        item_token: int,
+    ) -> None:
+        """Accept one scheduled pending record and release its guard."""
+        try:
+            if not self._unloaded:
+                await self._async_accept_pending(candidate_id, expected_item=item)
+        finally:
+            self._pending_accepting.discard(item_token)
+        if not self._unloaded and self._pending.get(candidate_id) is item:
+            # An early callback can happen around a clock boundary.  The
+            # acceptance method leaves the record pending in that case, so
+            # restore its timer after releasing the in-flight guard.
+            self._schedule_pending()
 
     async def _async_accept_pending(
         self,
         candidate_id: str,
         *,
         current: datetime | None = None,
+        expected_item: Mapping[str, Any] | None = None,
     ) -> bool:
         """Commit a durable candidate if it still exists and is not superseded."""
         item = self._pending.get(candidate_id)
-        if item is None:
+        if item is None or (expected_item is not None and item is not expected_item):
+            return False
+        if self._unloaded:
             return False
         current = current or self._current_time()
         if current < item["accept_at"]:
@@ -1064,9 +1198,10 @@ class AdaptiveLightingTraining:
 
     def _cancel_timers(self) -> None:
         """Cancel the deadline and every pending durability callback."""
-        if self._deadline_timer is not None:
-            self._deadline_timer()
-            self._deadline_timer = None
+        # This also advances the deadline generation and cancels any evaluator
+        # task, so a late callback from the previous session cannot clear or
+        # evaluate the replacement deadline installed by async_reset().
+        self._cancel_deadline_timer()
         for cancel in self._pending_timers.values():
             cancel()
         self._pending_timers.clear()
@@ -1414,16 +1549,23 @@ class AdaptiveLightingTraining:
 
     async def async_reset(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Reset learner/session state and begin a new shadow period."""
-        before = self._state_signature()
-        self._cancel_timers()
-        self._start_new_session(
-            _as_utc(now) if now is not None else self._current_time(),
-        )
-        if not self._loaded:
-            self._loaded = True
-        await self._persist_and_notify(before)
-        self._schedule_deadline()
-        return self.summary(now=now)
+        async with self._lifecycle_lock:
+            # An unloaded manager must remain immutable. A caller racing entity
+            # removal receives the last durable snapshot instead of a false
+            # success for state that can no longer be persisted.
+            if self._unloaded:
+                return self.summary(now=now)
+            before = self._state_signature()
+            self._cancel_timers()
+            await self._cancel_managed_tasks()
+            self._start_new_session(
+                _as_utc(now) if now is not None else self._current_time(),
+            )
+            if not self._loaded:
+                self._loaded = True
+            await self._persist_and_notify(before)
+            self._schedule_deadline()
+            return self.summary(now=now)
 
 
 def _stored_int(value: Any) -> int:

@@ -7,7 +7,9 @@ import datetime
 import json
 import logging
 import math
+import time
 import zoneinfo
+from collections import OrderedDict
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
@@ -434,6 +436,13 @@ def _fit_state_attribute_budget(  # noqa: PLR0912 - ordered degradation stages
 
 
 SCAN_INTERVAL = timedelta(seconds=10)
+TRAINING_STARTUP_GRACE_SECONDS = 5 * 60
+# Accepted fingerprints are deduplicated for one bounded observation window.
+# The window is deliberately finite so a later, genuine preference can be
+# learned again; the size cap keeps a noisy light fleet from growing memory.
+TRAINING_SAMPLE_DEDUPE_SECONDS = 15 * 60
+TRAINING_PENDING_SETTLE_SECONDS = 10
+MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES = 256
 
 # Consider it a significant change when attribute changes more than
 BRIGHTNESS_CHANGE = 25  # ≈10% of total range
@@ -690,6 +699,24 @@ def is_our_context(context: Context | None, which: str | None = None) -> bool:
     if context is None:
         return False
     return is_our_context_id(context.id, which)
+
+
+def _user_training_source(context: Context | None) -> str | None:
+    """Return a user source only for a direct, non-child external action.
+
+    A bare Home Assistant context is intentionally not enough to identify a
+    human action: it is also used by automations and integrations. Physical
+    observations are attributed separately by the non-HA state-difference
+    path below.
+    """
+    if (
+        context is None
+        or context.parent_id is not None
+        or is_our_context(context)
+        or context.user_id is None
+    ):
+        return None
+    return "user"
 
 
 def _switches_with_lights(
@@ -971,6 +998,7 @@ async def async_setup_entry(  # noqa: PLR0915
                     switch.fire_manual_control_event(
                         light,
                         service_call.context,
+                        training_source="manual_control_service",
                     )
             else:
                 switch.manager.reset(*all_lights)
@@ -1379,6 +1407,31 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         # Set in self._update_attrs_and_maybe_adapt_lights
         self._settings: dict[str, Any] = {}
         self._intelligence_decisions: dict[str, dict[str, Any]] = {}
+        # Training must not observe restore/startup transitions. The flag is
+        # enabled only after the normal light listeners have been installed.
+        self._training_observation_ready = False
+        # This is anchored to HA startup (or entity initialization when HA is
+        # already running), rather than to each listener re-installation.
+        self._training_observation_started_at: float | None = None
+        # Accepted brightness observations are retained only in the bounded,
+        # time-windowed cache documented by TRAINING_SAMPLE_DEDUPE_SECONDS and
+        # MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES. This blocks A -> B -> A bursts
+        # without permanently suppressing a later preference.
+        self._accepted_training_sample_fingerprints: OrderedDict[
+            tuple[str, tuple[Any, ...]],
+            float,
+        ] = OrderedDict()
+        # Durability candidates are tracked separately from accepted evidence.
+        # A changed correction for the same light supersedes this reservation,
+        # while an identical report cannot continuously restart durability.
+        self._pending_training_sample_fingerprints: OrderedDict[
+            tuple[str, tuple[Any, ...]],
+            float,
+        ] = OrderedDict()
+        self._training_sample_fingerprints_in_flight: set[
+            tuple[str, tuple[Any, ...]]
+        ] = set()
+        self._last_training_accepted_count = 0
         self._discovery_snapshot: InventorySnapshot | None = None
         self._discovered_context_entities: dict[str, list[str]] = {}
         self._environment_tracker = (
@@ -2766,14 +2819,62 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             for entity_id in self._discovered_context_entities.get("holidays", [])
         )
 
-    async def _async_training_changed(self, _: dict[str, Any]) -> None:
+    async def _async_training_changed(self, summary: dict[str, Any]) -> None:
         """Publish phase/sample changes without granting a new actuation path."""
+        counts = summary.get("sample_counts", {})
+        accepted_count = (
+            counts.get("accepted", self._last_training_accepted_count)
+            if isinstance(counts, Mapping)
+            else self._last_training_accepted_count
+        )
+        if (
+            isinstance(accepted_count, int)
+            and accepted_count > self._last_training_accepted_count
+        ):
+            sample_key = self._training_sample_key_from_summary(
+                summary.get("last_sample"),
+            )
+            if sample_key is not None:
+                self._pending_training_sample_fingerprints.pop(sample_key, None)
+                self._remember_accepted_training_sample(
+                    sample_key,
+                    self._training_clock(),
+                )
+            self._last_training_accepted_count = accepted_count
         if (
             self.hass.is_running
             and self.entity_id
             and self.hass.states.get(self.entity_id)
         ):
             self.async_write_ha_state()
+
+    @staticmethod
+    def _training_sample_key_from_summary(
+        sample: Any,
+    ) -> tuple[str, tuple[Any, ...]] | None:
+        """Recover a brightness fingerprint from an accepted training update."""
+        if not isinstance(sample, Mapping):
+            return None
+        metadata = sample.get("metadata")
+        light = metadata.get("entity_id") if isinstance(metadata, Mapping) else None
+        baseline = sample.get("baseline")
+        selected = sample.get("selected")
+        if (
+            not isinstance(light, str)
+            or not isinstance(baseline, (int, float))
+            or not isinstance(selected, (int, float))
+        ):
+            return None
+        return (
+            light,
+            (
+                round(float(baseline), 3),
+                round(float(selected)),
+                str(sample.get("intent", "")),
+                str(sample.get("time_bucket", "")),
+                str(sample.get("daylight_band", "")),
+            ),
+        )
 
     def _intelligence_entity_ids(self, name: str) -> list[str]:
         """Merge configured entities with live discovery without duplicates."""
@@ -2862,18 +2963,107 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         finally:
             self._intelligence_context_refresh_task = None
 
+    @staticmethod
+    def _training_clock() -> float:
+        """Return a monotonic clock that tests can inject."""
+        return time.monotonic()
+
+    def _training_startup_grace_active(self) -> bool:
+        """Fail closed until the conservative post-startup grace has elapsed."""
+        started_at = self._training_observation_started_at
+        if started_at is None:
+            return True
+        return self._training_clock() - started_at < TRAINING_STARTUP_GRACE_SECONDS
+
+    def _prune_training_sample_fingerprint_cache(self, now: float) -> None:
+        """Discard expired and over-cap accepted or pending fingerprints."""
+        cutoff = now - TRAINING_SAMPLE_DEDUPE_SECONDS
+        cache = self._accepted_training_sample_fingerprints
+        for sample_key, accepted_at in tuple(cache.items()):
+            if accepted_at <= cutoff:
+                cache.pop(sample_key, None)
+        while len(cache) > MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES:
+            cache.popitem(last=False)
+        pending = self._pending_training_sample_fingerprints
+        for sample_key, expires_at in tuple(pending.items()):
+            if expires_at <= now:
+                pending.pop(sample_key, None)
+        while len(pending) > MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES:
+            pending.popitem(last=False)
+
+    def _training_sample_was_recently_accepted(
+        self,
+        sample_key: tuple[str, tuple[Any, ...]],
+        now: float,
+    ) -> bool:
+        """Return whether an accepted fingerprint is still inside the window."""
+        self._prune_training_sample_fingerprint_cache(now)
+        accepted_at = self._accepted_training_sample_fingerprints.get(sample_key)
+        return accepted_at is not None and now - accepted_at < TRAINING_SAMPLE_DEDUPE_SECONDS
+
+    def _training_sample_is_pending(
+        self,
+        sample_key: tuple[str, tuple[Any, ...]],
+        now: float,
+    ) -> bool:
+        """Return whether the same durability candidate is still unresolved."""
+        self._prune_training_sample_fingerprint_cache(now)
+        expires_at = self._pending_training_sample_fingerprints.get(sample_key)
+        return expires_at is not None and now < expires_at
+
+    def _remember_accepted_training_sample(
+        self,
+        sample_key: tuple[str, tuple[Any, ...]],
+        accepted_at: float,
+    ) -> None:
+        """Remember one admitted sample without creating a permanent block."""
+        cache = self._accepted_training_sample_fingerprints
+        # Refreshing an accepted key makes the insertion order reflect the
+        # latest admission, while the monotonic timestamp controls expiry.
+        cache.pop(sample_key, None)
+        cache[sample_key] = accepted_at
+        self._prune_training_sample_fingerprint_cache(accepted_at)
+
+    def _remember_pending_training_sample(
+        self,
+        sample_key: tuple[str, tuple[Any, ...]],
+        expires_at: float,
+    ) -> None:
+        """Reserve one queued candidate without calling it accepted evidence."""
+        light, _fingerprint = sample_key
+        pending = self._pending_training_sample_fingerprints
+        # A different correction for this light supersedes the previous
+        # candidate in the training manager, so it also releases the local
+        # duplicate reservation. This keeps an intentional A -> B -> A change
+        # learnable while blocking repeated A -> A reports.
+        for existing_key in tuple(pending):
+            if existing_key[0] == light:
+                pending.pop(existing_key, None)
+        pending[sample_key] = expires_at
+        self._prune_training_sample_fingerprint_cache(self._training_clock())
+
+    async def _async_homeassistant_started(
+        self,
+        event: Event[NoEventData],
+    ) -> None:
+        """Anchor attribution grace to HA startup even when the switch is off."""
+        self._training_observation_started_at = self._training_clock()
+        await self._setup_listeners(event)
+
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to hass."""
         if self._discovery is not None:
             await self._discovery.async_start()
         if self._training is not None:
             await self._training.async_setup()
+            self._last_training_accepted_count = self._training.sample_count
         if self.hass.is_running:
+            self._training_observation_started_at = self._training_clock()
             await self._setup_listeners()
         else:
             self.hass.bus.async_listen_once(
                 EVENT_HOMEASSISTANT_STARTED,
-                self._setup_listeners,
+                self._async_homeassistant_started,
             )
         last_state: State | None = await self.async_get_last_state()
         is_new_entry = last_state is None  # newly added to HA
@@ -2928,6 +3118,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self.remove_listeners.append(remove_sleep)
         self._expand_light_groups()
         self._setup_intelligence_context_listener()
+        # Restore and first-start work happens before this point or through a
+        # forced adaptation. Only later state differences may be physical.
+        self._training_observation_ready = True
 
     def _update_time_interval_listener(self) -> None:
         """Create or recreate the adaptation interval listener.
@@ -4153,6 +4346,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self,
         light: str,
         context: Context,
+        *,
+        training_source: str | None = None,
+        observation_context: Context | None = None,
     ) -> None:
         """Fire an event that 'light' is marked as manual_control."""
         _LOGGER.debug(
@@ -4170,20 +4366,56 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             },
             context=context,
         )
-        self._schedule_training_sample(light, context, manual_attributes)
+        self._schedule_training_sample(
+            light,
+            context,
+            manual_attributes,
+            source=(
+                training_source
+                if training_source is not None
+                else _user_training_source(context)
+            ),
+            observation_context=observation_context,
+        )
 
-    def _schedule_training_sample(
+    def _schedule_training_sample(  # noqa: PLR0911 - fail-closed admission gates
         self,
         light: str,
         context: Context,
         manual_attributes: LightControlAttributes,
+        *,
+        source: str | None,
+        observation_context: Context | None = None,
     ) -> None:
-        """Offer a durable, attributable brightness correction to local training."""
+        """Offer one durable, attributable brightness correction to training."""
         if (
             self._training is None
             or not manual_attributes & LightControlAttributes.BRIGHTNESS
+            or not self.hass.is_running
+            or not self._training_observation_ready
+            or source not in {"physical", "user"}
         ):
             return
+
+        if source == "user":
+            # A user id without a parent is the only service-event evidence
+            # strong enough to classify a brightness correction as human.
+            if _user_training_source(context) != "user":
+                return
+        elif (
+            # The physical path is called from significant_change(), whose
+            # context is normally Adaptive Lighting's interval context. Use
+            # the light's observed state context to keep that distinction
+            # explicit and reject integration/startup/automation state.
+            observation_context is None
+            or observation_context.id is None
+            or observation_context.parent_id is not None
+            or observation_context.user_id is not None
+            or is_our_context(observation_context)
+            or self._training_startup_grace_active()
+        ):
+            return
+
         state = self.hass.states.get(light)
         brightness = (
             state.attributes.get(ATTR_BRIGHTNESS) if state is not None else None
@@ -4197,43 +4429,121 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             "target_brightness_pct",
             self._intelligence_baseline_brightness(),
         )
+        if not isinstance(baseline, (int, float)) or not math.isfinite(baseline):
+            return
+        if math.isclose(float(baseline), selected, abs_tol=1e-6):
+            _LOGGER.debug(
+                "%s: Ignoring unchanged brightness observation for '%s' (%s%%)",
+                self._name,
+                light,
+                selected,
+            )
+            return
         intent = current_decision.get(
             "intent",
             snapshot["intent_hint"],
         )
         time_bucket, daylight_band = self._intelligence_learning_dimensions(snapshot)
-        source = (
-            "user"
-            if context.user_id is not None
-            else "automation"
-            if context.parent_id is not None
-            else "physical"
+        fingerprint = (
+            round(float(baseline), 3),
+            selected,
+            str(intent),
+            time_bucket,
+            daylight_band,
         )
+        sample_key = (light, fingerprint)
+        now = self._training_clock()
+        if (
+            self._training_sample_was_recently_accepted(sample_key, now)
+            or self._training_sample_is_pending(sample_key, now)
+            or (
+            sample_key in self._training_sample_fingerprints_in_flight
+            )
+        ):
+            _LOGGER.debug(
+                "%s: Ignoring repeated brightness observation for '%s': %s",
+                self._name,
+                light,
+                fingerprint,
+            )
+            return
+
+        sample = {
+            "zone": self._name,
+            "baseline": baseline,
+            "selected": selected,
+            "source": source,
+            "intent": intent,
+            "time_bucket": time_bucket,
+            "daylight_band": daylight_band,
+            "safety_context": bool(
+                snapshot.get("emergency") or snapshot.get("sleep"),
+            ),
+            "hard_cap": bool(
+                snapshot.get("emergency") or snapshot.get("sleep"),
+            ),
+            "observed_at": dt_util.utcnow().isoformat(),
+            "metadata": {
+                "context_has_parent": context.parent_id is not None,
+                "context_has_user": context.user_id is not None,
+                "training_source": source,
+                "entity_id": light,
+                "observation_context_id": (
+                    observation_context.id if observation_context is not None else None
+                ),
+            },
+        }
+        # Reserve only while the async admission call is in flight. A rejected
+        # candidate must leave the same later observation eligible to retry.
+        self._training_sample_fingerprints_in_flight.add(sample_key)
         self.hass.async_create_task(
-            self._training.async_ingest_sample(
-                {
-                    "zone": self._name,
-                    "baseline": baseline,
-                    "selected": selected,
-                    "source": source,
-                    "intent": intent,
-                    "time_bucket": time_bucket,
-                    "daylight_band": daylight_band,
-                    "safety_context": bool(
-                        snapshot.get("emergency") or snapshot.get("sleep"),
-                    ),
-                    "hard_cap": bool(
-                        snapshot.get("emergency") or snapshot.get("sleep"),
-                    ),
-                    "observed_at": dt_util.utcnow().isoformat(),
-                    "metadata": {
-                        "context_has_parent": context.parent_id is not None,
-                        "context_has_user": context.user_id is not None,
-                    },
-                },
+            self._async_ingest_training_sample(
+                light=light,
+                fingerprint=fingerprint,
+                sample=sample,
             ),
             name=f"adaptive_lighting_training_{slugify(self._name)}",
         )
+
+    async def _async_ingest_training_sample(
+        self,
+        *,
+        light: str,
+        fingerprint: tuple[Any, ...],
+        sample: dict[str, Any],
+    ) -> None:
+        """Track queued and accepted outcomes without conflating the two."""
+        sample_key = (light, fingerprint)
+        try:
+            training = self._training
+            result = (
+                await training.async_ingest_candidate(sample)
+                if training is not None
+                else {"queued": False, "accepted": False}
+            )
+        except Exception:
+            _LOGGER.exception(
+                "%s: Brightness training sample ingestion failed for '%s'",
+                self._name,
+                light,
+            )
+        else:
+            if result.get("accepted"):
+                self._pending_training_sample_fingerprints.pop(sample_key, None)
+                self._remember_accepted_training_sample(
+                    sample_key,
+                    self._training_clock(),
+                )
+            elif result.get("queued") and training is not None:
+                now = self._training_clock()
+                self._remember_pending_training_sample(
+                    sample_key,
+                    now
+                    + max(1.0, float(training.durability_seconds))
+                    + TRAINING_PENDING_SETTLE_SECONDS,
+                )
+        finally:
+            self._training_sample_fingerprints_in_flight.discard(sample_key)
 
     @staticmethod
     def _intelligence_learning_dimensions(snapshot: dict[str, Any]) -> tuple[str, str]:
@@ -4375,6 +4685,9 @@ class AdaptiveLightingManager:
         self.manual_control: dict[str, LightControlAttributes] = {}
         # Track 'state_changed' events of self.lights resulting from this integration
         self.our_last_state_on_change: dict[str, list[State]] = {}
+        # The state context that supplied the latest external brightness
+        # difference. It is consumed once when a physical sample is offered.
+        self._last_significant_change_context: dict[str, Context] = {}
         # Track last 'service_data' to 'light.turn_on' resulting from this integration
         self.last_service_data: dict[str, dict[str, Any]] = {}
         # Track ongoing split adaptations to be able to cancel them
@@ -5012,6 +5325,7 @@ class AdaptiveLightingManager:
                 if timer := self.auto_reset_manual_control_timers.pop(light, None):
                     timer.cancel()
             self.our_last_state_on_change.pop(light, None)
+            self._last_significant_change_context.pop(light, None)
             self.last_service_data.pop(light, None)
             self.cancel_ongoing_adaptation_calls(light)
 
@@ -5282,7 +5596,14 @@ class AdaptiveLightingManager:
         # Light was already on and 'light.turn_on' was not called by
         # the adaptive_lighting integration.
         self.add_manual_control_attributes(light, turn_on_attributes)
-        switch.fire_manual_control_event(light, turn_on_event.context)
+        switch.fire_manual_control_event(
+            light,
+            turn_on_event.context,
+            # A direct user service call is learnable; a bare or parent-bearing
+            # service context remains manual takeover only, never a sample.
+            training_source=_user_training_source(turn_on_event.context)
+            or "unattributed_service",
+        )
         _LOGGER.debug(
             "'%s' was already on and 'light.turn_on' was not called by the"
             " adaptive_lighting integration (context.id='%s'), the Adaptive"
@@ -5319,11 +5640,17 @@ class AdaptiveLightingManager:
         if not significantly_changed_attributes:
             return
 
+        observation_context = self._last_significant_change_context.pop(light, None)
         self.add_manual_control_attributes(
             light,
             significantly_changed_attributes,
         )
-        switch.fire_manual_control_event(light, context)
+        switch.fire_manual_control_event(
+            light,
+            context,
+            training_source="physical",
+            observation_context=observation_context,
+        )
 
     async def significant_change(
         self,
@@ -5338,6 +5665,10 @@ class AdaptiveLightingManager:
         """
         assert switch._detect_non_ha_changes
 
+        # A context can survive several state reports. Clear the evidence
+        # token first so a no-op/invalid refresh cannot authorize a later
+        # training event.
+        self._last_significant_change_context.pop(light, None)
         last_service_data = self.last_service_data.get(light)
         if last_service_data is None:
             return LightControlAttributes.NONE
@@ -5348,6 +5679,22 @@ class AdaptiveLightingManager:
         await async_update_entity(self.hass, light)
         refreshed_state = self.hass.states.get(light)
         assert refreshed_state is not None
+
+        state_context = refreshed_state.context
+        turn_on_event = self.turn_on_event.get(light)
+        if (
+            state_context.id is None
+            or state_context.parent_id is not None
+            or state_context.user_id is not None
+            or is_our_context(state_context)
+            or (
+                turn_on_event is not None
+                and state_context.id == turn_on_event.context.id
+            )
+        ):
+            # State reports caused by Adaptive Lighting, a service call, or a
+            # restore/automation context are not physical preference evidence.
+            return LightControlAttributes.NONE
 
         changed_attributes = _attributes_have_changed(
             old_attributes=last_service_data,
@@ -5374,6 +5721,8 @@ class AdaptiveLightingManager:
                 last_service_data,
                 context.id,
             )
+        if changed_attributes & LightControlAttributes.BRIGHTNESS:
+            self._last_significant_change_context[light] = state_context
         return changed_attributes
 
     def _off_to_on_state_event_is_from_turn_on(

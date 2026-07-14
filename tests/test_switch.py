@@ -93,6 +93,9 @@ from homeassistant.components.adaptive_lighting.switch import (
     MAX_STATE_DIAGNOSTIC_ITEMS,
     MAX_STATE_INTELLIGENCE_DECISIONS,
     MAX_STATE_SAMPLE_COUNTS,
+    MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES,
+    TRAINING_SAMPLE_DEDUPE_SECONDS,
+    TRAINING_STARTUP_GRACE_SECONDS,
     AdaptiveLightingManager,
     AdaptiveSwitch,
     SimpleSwitch,
@@ -136,6 +139,7 @@ from homeassistant.const import (
     CONF_LIGHTS,
     CONF_NAME,
     EVENT_CALL_SERVICE,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_STATE_CHANGED,
     SERVICE_TOGGLE,
     SERVICE_TURN_ON,
@@ -2070,6 +2074,378 @@ async def test_intelligence_training_forces_shadow_then_auto_promotes(hass):
     assert promoted is True
     assert switch._intelligence_shadow_actuation_blocked is False
     assert switch.extra_state_attributes["intelligence_training"]["phase"] == "active"
+
+
+async def test_brightness_training_requires_explicit_attribution_and_deduplicates(
+    hass,
+):
+    """Only a direct user context may train from the service-event path."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+
+    switch._intelligence_decisions[ENTITY_LIGHT_1] = {
+        "target_brightness_pct": 80,
+        "intent": "ambient",
+    }
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, {ATTR_BRIGHTNESS: 128})
+
+    # Startup/restore, Adaptive Lighting, parent-bearing automation, and bare
+    # service contexts must remain manual takeover signals, not training input.
+    noise_contexts = (
+        Context(),
+        switch.create_context("startup_restore"),
+        Context(id="automation-child", parent_id="automation-parent"),
+        Context(id="bare-automation"),
+    )
+    for context in noise_contexts:
+        switch.fire_manual_control_event(ENTITY_LIGHT_1, context)
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 0
+
+    switch.fire_manual_control_event(
+        ENTITY_LIGHT_1,
+        Context(user_id="00000000000000000000000000000001"),
+    )
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 1
+    assert switch._training.last_sample["source"] == "user"
+
+    # A repeated unchanged report, even with a new user context, is not a new
+    # preference observation.
+    switch.fire_manual_control_event(
+        ENTITY_LIGHT_1,
+        Context(user_id="00000000000000000000000000000002"),
+    )
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 1
+
+
+async def test_brightness_training_accepts_external_physical_change_once(hass):
+    """A state-difference observation remains learnable but is deduplicated."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+
+    switch._intelligence_decisions[ENTITY_LIGHT_1] = {
+        "target_brightness_pct": 80,
+        "intent": "ambient",
+    }
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, {ATTR_BRIGHTNESS: 128})
+
+    physical_state_context = Context(id="wall-switch-report")
+    startup_clock = 1000.0
+    switch._training_observation_started_at = startup_clock
+    with patch.object(switch, "_training_clock", return_value=startup_clock):
+        switch.fire_manual_control_event(
+            ENTITY_LIGHT_1,
+            switch.create_context("interval"),
+            training_source="physical",
+            observation_context=physical_state_context,
+        )
+    await hass.async_block_till_done()
+    # Bare physical reports are still ambiguous during HA's startup window.
+    assert switch._training.sample_count == 0
+
+    with patch.object(
+        switch,
+        "_training_clock",
+        return_value=startup_clock + TRAINING_STARTUP_GRACE_SECONDS + 1,
+    ):
+        switch.fire_manual_control_event(
+            ENTITY_LIGHT_1,
+            switch.create_context("interval"),
+            training_source="physical",
+            observation_context=physical_state_context,
+        )
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 1
+    assert switch._training.last_sample["source"] == "physical"
+
+    # Different Adaptive Lighting and device-report contexts still describe
+    # the same unchanged brightness observation.
+    switch.fire_manual_control_event(
+        ENTITY_LIGHT_1,
+        switch.create_context("interval"),
+        training_source="physical",
+        observation_context=Context(id="wall-switch-report-again"),
+    )
+    await hass.async_block_till_done()
+    assert switch._training.sample_count == 1
+
+
+async def test_brightness_training_retries_after_rejected_admission(hass):
+    """A rejected candidate must not permanently reserve its fingerprint."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+
+    switch._intelligence_decisions[ENTITY_LIGHT_1] = {
+        "target_brightness_pct": 80,
+        "intent": "ambient",
+    }
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, {ATTR_BRIGHTNESS: 128})
+
+    ingest = AsyncMock(
+        side_effect=[
+            {"queued": False, "accepted": False},
+            {"queued": False, "accepted": True},
+        ],
+    )
+    with patch.object(switch._training, "async_ingest_candidate", new=ingest):
+        user_context = Context(user_id="00000000000000000000000000000001")
+        switch.fire_manual_control_event(ENTITY_LIGHT_1, user_context)
+        # This duplicate races the first admission and must not queue twice.
+        switch.fire_manual_control_event(
+            ENTITY_LIGHT_1,
+            Context(user_id="00000000000000000000000000000002"),
+        )
+        await hass.async_block_till_done()
+        assert ingest.await_count == 1
+        assert not switch._accepted_training_sample_fingerprints
+
+        # Once the rejected in-flight admission has released its reservation,
+        # the same valid observation can be attempted again.
+        switch.fire_manual_control_event(
+            ENTITY_LIGHT_1,
+            Context(user_id="00000000000000000000000000000003"),
+        )
+        await hass.async_block_till_done()
+
+    assert ingest.await_count == 2
+    assert switch._accepted_training_sample_fingerprints
+
+
+async def test_brightness_training_deduplicates_a_b_a_then_expires(hass):
+    """Rolling cache blocks A-B-A inflation but expires after fifteen minutes."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+    switch._intelligence_decisions[ENTITY_LIGHT_1] = {
+        "target_brightness_pct": 80,
+        "intent": "ambient",
+    }
+    switch.manager.set_manual_control_attributes(
+        ENTITY_LIGHT_1,
+        LightControlAttributes.BRIGHTNESS,
+    )
+    user = Context(user_id="00000000000000000000000000000001")
+    clock = [1000.0]
+
+    with patch.object(switch, "_training_clock", side_effect=lambda: clock[0]):
+        for brightness in (128, 153, 128):
+            hass.states.async_set(
+                ENTITY_LIGHT_1,
+                STATE_ON,
+                {ATTR_BRIGHTNESS: brightness},
+            )
+            switch.fire_manual_control_event(ENTITY_LIGHT_1, user)
+            await hass.async_block_till_done()
+        assert switch._training.sample_count == 2
+
+        clock[0] += TRAINING_SAMPLE_DEDUPE_SECONDS + 1
+        switch.fire_manual_control_event(ENTITY_LIGHT_1, user)
+        await hass.async_block_till_done()
+        assert switch._training.sample_count == 3
+
+
+async def test_training_fingerprint_cache_is_bounded(hass):
+    """A noisy fleet cannot grow the accepted-fingerprint cache without bound."""
+    switch, _ = await setup_lights_and_switch(hass, {})
+    for index in range(MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES + 1):
+        switch._remember_accepted_training_sample(
+            (f"light.fixture_{index}", (index,)),
+            1000.0 + index,
+        )
+
+    assert (
+        len(switch._accepted_training_sample_fingerprints)
+        == MAX_TRAINING_SAMPLE_DEDUPE_ENTRIES
+    )
+    assert ("light.fixture_0", (0,)) not in (
+        switch._accepted_training_sample_fingerprints
+    )
+
+
+async def test_delayed_training_acceptance_promotes_pending_fingerprint(hass):
+    """A durability callback moves evidence from pending to accepted dedupe."""
+    switch, _ = await setup_lights_and_switch(hass, {})
+    fingerprint = (80.0, 50, "ambient", "evening", "dark")
+    sample_key = (ENTITY_LIGHT_1, fingerprint)
+    switch._pending_training_sample_fingerprints[sample_key] = 2000.0
+    switch._last_training_accepted_count = 0
+
+    with patch.object(switch, "_training_clock", return_value=1000.0):
+        await switch._async_training_changed(
+            {
+                "sample_counts": {"accepted": 1},
+                "last_sample": {
+                    "baseline": 80,
+                    "selected": 50,
+                    "intent": "ambient",
+                    "time_bucket": "evening",
+                    "daylight_band": "dark",
+                    "metadata": {"entity_id": ENTITY_LIGHT_1},
+                },
+            },
+        )
+
+    assert sample_key not in switch._pending_training_sample_fingerprints
+    assert sample_key in switch._accepted_training_sample_fingerprints
+
+
+@pytest.mark.parametrize(
+    ("state_context_kind", "accepted"),
+    [
+        ("bare_external", True),
+        ("parent_automation", False),
+        ("user_service", False),
+        ("adaptive_lighting", False),
+    ],
+)
+async def test_untracked_brightness_attribution_uses_state_context(
+    hass,
+    state_context_kind,
+    accepted,
+):
+    """Only a bare external state report can train the physical path."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+            CONF_INTELLIGENCE_DURABILITY_SECONDS: 0,
+        },
+    )
+    assert switch._training is not None
+
+    switch._intelligence_decisions[ENTITY_LIGHT_1] = {
+        "target_brightness_pct": 80,
+        "intent": "ambient",
+    }
+    switch.manager.manual_control[ENTITY_LIGHT_1] = LightControlAttributes.NONE
+    switch.manager.last_service_data[ENTITY_LIGHT_1] = {ATTR_BRIGHTNESS: 255}
+    switch.manager.turn_on_event.pop(ENTITY_LIGHT_1, None)
+
+    if state_context_kind == "bare_external":
+        state_context = Context(id="bare-external-report")
+    elif state_context_kind == "parent_automation":
+        state_context = Context(
+            id="automation-child",
+            parent_id="automation-parent",
+        )
+    elif state_context_kind == "user_service":
+        state_context = Context(id="service-report", user_id="user")
+    else:
+        state_context = switch.create_context("physical-report")
+    hass.states.async_set(
+        ENTITY_LIGHT_1,
+        STATE_ON,
+        {ATTR_BRIGHTNESS: 128},
+        context=state_context,
+    )
+    await hass.async_block_till_done()
+
+    # The manager's production path supplies the refreshed State context to
+    # training; the manager context itself is intentionally not attribution.
+    switch._training_observation_started_at = 0.0
+    with (
+        patch(
+            "homeassistant.components.adaptive_lighting.switch.async_update_entity",
+            new=AsyncMock(),
+        ),
+        patch.object(
+            switch,
+            "_training_clock",
+            return_value=TRAINING_STARTUP_GRACE_SECONDS + 1,
+        ),
+    ):
+        await switch.manager.update_manually_controlled_from_untracked_change(
+            switch,
+            ENTITY_LIGHT_1,
+            force=False,
+            context=switch.create_context("interval"),
+        )
+    await hass.async_block_till_done()
+
+    manual_attributes = switch.manager.get_manual_control_attributes(ENTITY_LIGHT_1)
+    if accepted:
+        assert manual_attributes & LightControlAttributes.BRIGHTNESS
+        assert switch._training.sample_count == 1
+        assert switch._training.last_sample["source"] == "physical"
+    else:
+        assert not manual_attributes & LightControlAttributes.BRIGHTNESS
+        assert switch._training.sample_count == 0
+
+
+async def test_training_startup_listener_anchors_grace_while_switch_is_off(hass):
+    """Startup grace is anchored before an initially-off switch installs listeners."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_SHADOW_MODE: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    await switch.async_turn_off()
+    switch._training_observation_started_at = None
+    switch._training_observation_ready = False
+    startup_clock = 1234.0
+
+    with patch.object(switch, "_training_clock", return_value=startup_clock):
+        await switch._async_homeassistant_started(
+            Event(EVENT_HOMEASSISTANT_STARTED, {}),
+        )
+        assert switch._training_observation_started_at == startup_clock
+        assert switch._training_startup_grace_active()
+    assert switch._training_observation_ready is False
+
+    # Listener installation on turn-on must not restart the HA-wide grace timer.
+    await switch.async_turn_on(adapt_lights=False)
+    assert switch._training_observation_started_at == startup_clock
+    assert switch._training_observation_ready is True
 
 
 def _register_state_entity(
