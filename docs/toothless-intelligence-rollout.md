@@ -186,6 +186,44 @@ the off-device copy cannot be restored. Raw environmental sample buffers are
 intentionally absent from backups and start cold after a restart so stale
 humidity cannot actuate a future extractor.
 
+### Startup-noise recovery and attribution hardening
+
+The first commissioning day exposed a Home Assistant timer-callback defect:
+durability callbacks were created by a synchronous lambda that returned a
+coroutine, so Home Assistant did not await the acceptance operation. Three
+overdue brightness candidates and repeated exact-baseline observations also
+coincided with an integration restart. They are startup evidence, not reliable
+human preference evidence.
+
+The hardening release uses these recovery rules:
+
+- point-in-time callbacks synchronously create lifecycle-owned tasks; stale
+  callbacks are generation checked, and unload waits for in-flight persistence
+  before its final Store write;
+- direct user service calls are learnable only with a user context and no
+  parent context; physical observations use the refreshed light-state context,
+  while automation, integration-owned, child, and unattributed service contexts
+  remain manual-control signals but are excluded from brightness training;
+- physical brightness observations are suppressed during a five-minute
+  Home Assistant startup/reload grace period, exact-baseline observations are
+  ignored, and a bounded time-windowed fingerprint cache prevents short-loop
+  duplicates without suppressing a preference repeated meaningfully later;
+- before deploying the hardening release, stop Home Assistant and run the
+  guarded `scripts/reset_toothless_brightness_training.py` recovery tool. It
+  refuses a running container, snapshots both private learning Stores and the
+  installed component into one collision-resistant rollback directory, clears
+  only preference learner entries and pending brightness candidates, preserves
+  rejection/supersession and last-event diagnostics, retains the separate
+  behavior runtime Store and its accepted commissioning ledger, and restarts
+  the minimum seven-day shadow interval. The verified first-day behavior ledger
+  contains weekday observations only; the tool fails closed if the live Store
+  no longer matches that fact. This is a one-time recovery from known
+  contaminated evidence, not a normal restart action;
+- verify after restart that the phase remains `shadow_learning`, pending
+  brightness count is zero, retained behavior counts match the pre-deployment
+  backup, no learned power action is emitted, and no coroutine or oversized
+  state-attribute warning appears in Home Assistant logs.
+
 ## Release and rollback gates
 
 Release requires the full test suite, static checks, configuration validation,
@@ -194,6 +232,9 @@ and a verified zero learned-power-call shadow interval. Expected deterministic
 brightness calls must be attributable only to already-on lights or intercepted
 external turn-ons. Rollback consists of disabling the native shadow baseline,
 re-enabling the saved lighting automations, disabling intelligence/auto-
-promotion, restoring the backed-up component and configuration, and restarting
-Home Assistant. Local model storage can be retained for diagnosis or deleted
-explicitly; it never contains credentials or raw event objects.
+promotion, stopping Home Assistant, restoring the component directory and both
+private Store files from the exact rollback directory printed by the recovery
+tool, and restarting Home Assistant. Verify the restored phase, counters, and
+component version before re-enabling normal lighting behavior. Local model
+storage can otherwise be retained for diagnosis or deleted explicitly; it never
+contains credentials or raw event objects.
