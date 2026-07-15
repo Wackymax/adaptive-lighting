@@ -35,6 +35,12 @@ from .behavior import (
     normalize_behavior_event,
     normalize_good_night_routine,
 )
+from .const import (
+    BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY,
+    BEHAVIOR_AUTHORITY_OFF_ONLY,
+    BEHAVIOR_AUTHORITY_ON_OFF,
+    VALID_BEHAVIOR_AUTHORITY_POLICIES,
+)
 from .temporal_model import (
     ActionProvenance,
     OnlineActionModel,
@@ -155,6 +161,7 @@ class CandidateRecord:
     available: bool = True
     explicit_light_switch: bool = False
     manual_hold: bool = False
+    behavior_policy: str = BEHAVIOR_AUTHORITY_ON_OFF
 
     @property
     def availability(self) -> bool:
@@ -165,6 +172,11 @@ class CandidateRecord:
     def is_light_like_switch(self) -> bool:
         """Return whether a switch has explicit permission to act like a light."""
         return self.domain == "switch" and self.explicit_light_switch
+
+    @property
+    def behavior_authority(self) -> str:
+        """Return the configured learned power-state authority."""
+        return self.behavior_policy
 
 
 Candidate = CandidateRecord
@@ -188,6 +200,7 @@ class BehaviorProposal:
     proposal_id: str | None = None
     ready: bool = False
     executed: bool = False
+    behavior_policy: str = BEHAVIOR_AUTHORITY_ON_OFF
 
     @property
     def service_domain(self) -> str:
@@ -211,6 +224,7 @@ class BehaviorProposal:
             "executed": self.executed,
             "reason": self.reason,
             "proposal_id": self.proposal_id,
+            "behavior_policy": self.behavior_policy,
         }
 
 
@@ -599,6 +613,11 @@ class BehaviorRuntimeAdapter:
                 record.candidate is not None and record.candidate.available
                 for record in self._entities.values()
             ),
+            "candidate_policies": {
+                entity_id: record.candidate.behavior_policy
+                for entity_id, record in sorted(self._entities.items())
+                if record.candidate is not None
+            },
             "sample_counts": sample_counts,
             "accepted_observations": accepted_observations,
             "behavior_accepted_count": accepted_observations,
@@ -1585,6 +1604,12 @@ class BehaviorRuntimeAdapter:
                         ),
                     ),
                 ),
+                behavior_policy=str(
+                    value.get(
+                        "behavior_policy",
+                        value.get("behavior_authority", BEHAVIOR_AUTHORITY_ON_OFF),
+                    ),
+                ),
             )
         else:
             return None
@@ -1598,6 +1623,11 @@ class BehaviorRuntimeAdapter:
             return None
         if domain == "switch" and not candidate.explicit_light_switch:
             return None
+        behavior_policy = _text(candidate.behavior_policy)
+        if behavior_policy not in VALID_BEHAVIOR_AUTHORITY_POLICIES:
+            # The runtime is the final actuator boundary.  Unknown policy values
+            # must never silently acquire authority to change a fixture state.
+            return None
         return CandidateRecord(
             entity_id=entity_id,
             area=_text(candidate.area) or "unknown",
@@ -1606,6 +1636,7 @@ class BehaviorRuntimeAdapter:
             available=bool(candidate.available),
             explicit_light_switch=bool(candidate.explicit_light_switch),
             manual_hold=bool(candidate.manual_hold),
+            behavior_policy=behavior_policy,
         )
 
     def _reconcile_candidates(self, at: datetime) -> bool:
@@ -2001,6 +2032,64 @@ class BehaviorRuntimeAdapter:
             candidate = record.candidate
             if candidate is None or not candidate.available:
                 continue
+            current = self._current_state(entity_id)
+            if current is None:
+                self._last_rejection_reason = "unknown_entity_state"
+                continue
+
+            # A fixture policy is an explicit safety boundary, separate from
+            # confidence and manual-control gates.  Brightness-only fixtures
+            # remain observable but have no learned power-state authority.
+            if candidate.behavior_policy == BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY:
+                proposal = BehaviorProposal(
+                    entity_id=entity_id,
+                    area=candidate.area,
+                    domain=candidate.domain,
+                    action="none",
+                    service="",
+                    probability=0.0,
+                    confidence=0.0,
+                    effective_support=0.0,
+                    fresh=False,
+                    active=False,
+                    reason="brightness_only",
+                    ready=False,
+                    executed=False,
+                    behavior_policy=candidate.behavior_policy,
+                )
+                proposals.append(proposal)
+                self._remember_decision(proposal.as_dict())
+                record.last_access = self._next_access()
+                continue
+
+            # Off-only fixtures may learn and carry out a safe shutoff, but
+            # never propose or execute an automatic turn-on.  This check comes
+            # before pending proposals so a pre-existing pending on action is
+            # also blocked after a policy change.
+            if (
+                candidate.behavior_policy == BEHAVIOR_AUTHORITY_OFF_ONLY
+                and current == STATE_OFF
+            ):
+                proposal = BehaviorProposal(
+                    entity_id=entity_id,
+                    area=candidate.area,
+                    domain=candidate.domain,
+                    action="on",
+                    service="turn_on",
+                    probability=0.0,
+                    confidence=0.0,
+                    effective_support=0.0,
+                    fresh=False,
+                    active=False,
+                    reason="authority_off_only",
+                    ready=False,
+                    executed=False,
+                    behavior_policy=candidate.behavior_policy,
+                )
+                proposals.append(proposal)
+                self._remember_decision(proposal.as_dict())
+                record.last_access = self._next_access()
+                continue
             pending_items = record.model.to_dict()["pending"]
             if pending_items:
                 pending = pending_items[0]
@@ -2019,14 +2108,11 @@ class BehaviorRuntimeAdapter:
                     proposal_id=pending["proposal_id"],
                     ready=False,
                     executed=False,
+                    behavior_policy=candidate.behavior_policy,
                 )
                 proposals.append(proposal)
                 self._remember_decision(proposal.as_dict())
                 record.last_access = self._next_access()
-                continue
-            current = self._current_state(entity_id)
-            if current is None:
-                self._last_rejection_reason = "unknown_entity_state"
                 continue
             action = "on" if current == STATE_OFF else "off"
             entity_context = self._context_for_area(context_mapping, record.area)
@@ -2102,6 +2188,7 @@ class BehaviorRuntimeAdapter:
                 proposal_id,
                 ready,
                 executed,
+                candidate.behavior_policy,
             )
             proposals.append(proposal)
             self._remember_decision(proposal.as_dict())
@@ -2120,6 +2207,15 @@ class BehaviorRuntimeAdapter:
         at: datetime,
     ) -> bool:
         if self._stopped:
+            return False
+        # Defend the service-call boundary as well as evaluation.  This keeps a
+        # future caller from bypassing the per-fixture authority policy.
+        if candidate.behavior_policy == BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY:
+            return False
+        if (
+            candidate.behavior_policy == BEHAVIOR_AUTHORITY_OFF_ONLY
+            and action != "off"
+        ):
             return False
         if candidate.domain not in _LIGHT_DOMAINS or (
             candidate.domain == "switch" and not candidate.explicit_light_switch

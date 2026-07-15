@@ -111,6 +111,7 @@ from .const import (
     CONF_INCLUDE_CONFIG_IN_ATTRIBUTES,
     CONF_INITIAL_TRANSITION,
     CONF_INTELLIGENCE_AUTO_PROMOTE,
+    CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY,
     CONF_INTELLIGENCE_DURABILITY_SECONDS,
     CONF_INTELLIGENCE_ENABLED,
     CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS,
@@ -1540,6 +1541,11 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._intelligence_light_min_brightness: dict[str, int] = dict(
             data[CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS],
         )
+        # Explicitly constrain what learned behavior may change per fixture.
+        # Unmapped discovered lights retain the conservative on/off default.
+        self._intelligence_behavior_authority: dict[str, str] = dict(
+            data[CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY],
+        )
         self._intelligence_training_config = {
             "enabled": data[CONF_INTELLIGENCE_TRAINING_ENABLED],
             "training_days": data[CONF_INTELLIGENCE_TRAINING_DAYS],
@@ -1784,6 +1790,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 available=available,
                 explicit_light_switch=is_light_switch,
                 manual_hold=manual_hold,
+                behavior_policy=self._intelligence_behavior_authority.get(
+                    entity_id,
+                    "on_off",
+                ),
             )
             entry = registry.async_get(entity_id)
             state = self.hass.states.get(entity_id)

@@ -16,6 +16,10 @@ from homeassistant.components.adaptive_lighting.behavior_runtime import (
     BehaviorRuntimeAdapter,
     CandidateRecord,
 )
+from homeassistant.components.adaptive_lighting.const import (
+    BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY,
+    BEHAVIOR_AUTHORITY_OFF_ONLY,
+)
 from homeassistant.const import EVENT_CALL_SERVICE, EVENT_STATE_CHANGED
 from homeassistant.core import Context, Event, State
 from homeassistant.util import dt as dt_util
@@ -208,6 +212,43 @@ def _light_switch(
     }
     value.update(changes)
     return CandidateRecord(**value)
+
+
+async def test_brightness_only_policy_never_proposes_power_state_changes(hass) -> None:
+    """Brightness authority is not permission to learn fixture on/off behavior."""
+    _register_light_services(hass)
+    await _set_automation_state(hass, "light.living", "off")
+    runtime = await _runtime(
+        hass,
+        [_light(behavior_policy=BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY)],
+        actuation_enabled=lambda: True,
+    )
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME)
+
+    assert len(proposals) == 1
+    assert proposals[0].action == "none"
+    assert proposals[0].reason == "brightness_only"
+    assert not proposals[0].ready
+    assert hass.states.get("light.living").state == "off"
+    assert runtime.diagnostics["candidate_policies"]["light.living"] == "brightness_only"
+
+
+async def test_off_only_policy_blocks_turn_on_before_pending_or_actuation(hass) -> None:
+    """Off-only fixtures must not revive themselves, even with actuation enabled."""
+    _register_light_services(hass)
+    await _set_automation_state(hass, "light.living", "off")
+    candidate = _light(behavior_policy=BEHAVIOR_AUTHORITY_OFF_ONLY)
+    runtime = await _runtime(hass, [candidate], actuation_enabled=lambda: True)
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME)
+
+    assert len(proposals) == 1
+    assert proposals[0].action == "on"
+    assert proposals[0].reason == "authority_off_only"
+    assert not proposals[0].ready
+    assert not await runtime._async_actuate(candidate, "on", BASE_TIME)
+    assert hass.states.get("light.living").state == "off"
 
 
 @pytest.mark.parametrize(

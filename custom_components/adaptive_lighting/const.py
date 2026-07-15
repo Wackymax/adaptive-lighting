@@ -25,6 +25,14 @@ class TakeOverControlMode(Enum):
     PAUSE_CHANGED = "pause_changed"
 
 
+class BehaviorAuthorityPolicy(str, Enum):
+    """Per-entity authority granted to learned power-state behavior."""
+
+    BRIGHTNESS_ONLY = "brightness_only"
+    ON_OFF = "on_off"
+    OFF_ONLY = "off_only"
+
+
 DOCS = {CONF_ENTITY_ID: "Entity ID of the switch. 📝"}
 
 
@@ -315,6 +323,41 @@ DOCS[CONF_INTELLIGENCE_LIGHT_MIN_BRIGHTNESS] = (
     "as power off."
 )
 
+CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY, DEFAULT_INTELLIGENCE_BEHAVIOR_AUTHORITY = (
+    "intelligence_behavior_authority",
+    {},
+)
+# Short aliases keep the option usable by callers that refer to the runtime
+# boundary without the broader intelligence prefix.
+CONF_BEHAVIOR_AUTHORITY = CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY
+CONF_BEHAVIOR_AUTHORITY_POLICIES = CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY
+BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY = BehaviorAuthorityPolicy.BRIGHTNESS_ONLY.value
+BEHAVIOR_AUTHORITY_ON_OFF = BehaviorAuthorityPolicy.ON_OFF.value
+BEHAVIOR_AUTHORITY_OFF_ONLY = BehaviorAuthorityPolicy.OFF_ONLY.value
+BEHAVIOR_POLICY_BRIGHTNESS_ONLY = BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY
+BEHAVIOR_POLICY_ON_OFF = BEHAVIOR_AUTHORITY_ON_OFF
+BEHAVIOR_POLICY_OFF_ONLY = BEHAVIOR_AUTHORITY_OFF_ONLY
+VALID_BEHAVIOR_AUTHORITY_POLICIES = frozenset(
+    {
+        BEHAVIOR_AUTHORITY_BRIGHTNESS_ONLY,
+        BEHAVIOR_AUTHORITY_ON_OFF,
+        BEHAVIOR_AUTHORITY_OFF_ONLY,
+    },
+)
+BEHAVIOR_AUTHORITY_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            cv.entity_id: vol.In(sorted(VALID_BEHAVIOR_AUTHORITY_POLICIES)),
+        },
+    ),
+    vol.Coerce(dict),
+)
+DOCS[CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY] = (
+    "Optional mapping of light entity IDs to learned power-state authority. "
+    "Values are `brightness_only`, `on_off`, or `off_only`; unmapped entities "
+    "default to `on_off`."
+)
+
 CONF_INTELLIGENCE_TRAINING_ENABLED, DEFAULT_INTELLIGENCE_TRAINING_ENABLED = (
     "intelligence_training_enabled",
     False,
@@ -580,6 +623,11 @@ VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
             vol.Schema({cv.entity_id: int_between(1, 100)}),
             vol.Coerce(dict),
         ),
+    ),
+    (
+        CONF_INTELLIGENCE_BEHAVIOR_AUTHORITY,
+        DEFAULT_INTELLIGENCE_BEHAVIOR_AUTHORITY,
+        BEHAVIOR_AUTHORITY_SCHEMA,
     ),
     (
         CONF_INTELLIGENCE_TRAINING_ENABLED,

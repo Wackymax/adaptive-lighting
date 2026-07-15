@@ -40,6 +40,27 @@ the model learns the choice without immediately fighting it.
   automatically. An area move resets room-specific model state instead of
   carrying a learned behavior into the new room.
 
+### Per-fixture learned power authority
+
+`intelligence_behavior_authority` is a deliberate, fail-closed boundary for
+the learned on/off runtime. It is evaluated before pending proposals and again
+at the service-call boundary, so changing a fixture from `on_off` to `off_only`
+cannot leave an older pending automatic turn-on executable.
+
+- `brightness_only` keeps a fixture out of learned power-state proposals. The
+  current `switch.main_bathroom_light_switch` is recorded this way while it is
+  an on/off switch; when the planned dimmer exposes a new `light.*` entity,
+  assign that entity the same policy for brightness adaptation without learned
+  power control.
+- `on_off` permits learned turn-on and turn-off once the normal confidence,
+  safety, occupancy, manual-hold, and promotion gates have passed. Toothless
+  uses it for the garage light, living-room lamp, kitchen cabinet strip, and
+  kitchen ceiling light.
+- `off_only` permits learned shutoff but never learned turn-on. Toothless uses
+  it for the guest-bathroom light. Its separate occupancy automation is also
+  off-only: it waits for occupancy to clear, then turns the light off after its
+  hold only when the fixture is still on and no manual hold is active.
+
 ## Commissioning sequence
 
 1. Back up the live component, configuration, dashboard, and automations.
