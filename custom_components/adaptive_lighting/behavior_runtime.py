@@ -64,6 +64,7 @@ MAX_DIAGNOSTIC_REJECTION_ENTITIES = 16
 MAX_TRACKED_CONTEXTS = 512
 MAX_TRACKED_STATES = 256
 MAX_CONTEXT_AGE = timedelta(minutes=10)
+MAX_CONTEXT_FUTURE_SKEW = timedelta(seconds=5)
 MAX_SERVICE_ATTRIBUTION_AGE = timedelta(seconds=30)
 DEFAULT_REMOVED_RETENTION = timedelta(days=7)
 DEFAULT_EMPTY_DWELL = timedelta(minutes=5)
@@ -2004,7 +2005,9 @@ class BehaviorRuntimeAdapter:
             return False, None, None, None
         age = (now - observed).total_seconds()
         return (
-            0 <= age <= self.context_max_age.total_seconds(),
+            -MAX_CONTEXT_FUTURE_SKEW.total_seconds()
+            <= age
+            <= self.context_max_age.total_seconds(),
             observed,
             round(age, 3),
             "context_timestamp",
@@ -2075,7 +2078,7 @@ class BehaviorRuntimeAdapter:
         fresh, observed, age, _source = self._context_freshness(context, now)
         if observed is None:
             return "missing_context_timestamp"
-        if age is not None and age < 0:
+        if age is not None and age < -MAX_CONTEXT_FUTURE_SKEW.total_seconds():
             return "future_context_timestamp"
         if not fresh:
             return "stale_context"

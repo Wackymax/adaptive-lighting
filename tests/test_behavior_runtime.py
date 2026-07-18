@@ -1208,6 +1208,48 @@ async def test_decision_diagnostics_explain_context_freshness(hass) -> None:
     await runtime.async_stop()
 
 
+async def test_context_created_during_evaluation_allows_small_future_skew(hass) -> None:
+    context = _context(timestamp=BASE_TIME + timedelta(microseconds=500))
+    runtime = await _runtime(
+        hass,
+        [_light()],
+        context=context,
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    runtime._states["light.living"] = "off"
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME)
+
+    assert proposals
+    assert proposals[0].reason != "stale_context"
+    assert proposals[0].reason != "future_context_timestamp"
+    assert proposals[0].context_age_seconds == -0.001
+    await runtime.async_stop()
+
+
+async def test_context_beyond_future_skew_fails_closed(hass) -> None:
+    context = _context(timestamp=BASE_TIME + timedelta(seconds=6))
+    runtime = await _runtime(
+        hass,
+        [_light()],
+        context=context,
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    runtime._states["light.living"] = "off"
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME)
+
+    assert proposals
+    assert proposals[0].reason == "future_context_timestamp"
+    await runtime.async_stop()
+
+
 async def test_presence_intelligence_area_signal_is_used_for_learning(hass) -> None:
     """Fused room presence must enter the accepted observation features."""
     context = _context(
