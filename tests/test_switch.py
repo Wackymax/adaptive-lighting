@@ -2760,6 +2760,56 @@ async def test_behavior_context_separates_area_activity(
     assert all("unbounded" not in value for value in area_context["Living"].values())
 
 
+async def test_behavior_context_consumes_presence_intelligence_fused_presence(
+    hass,
+    area_registry,
+    entity_registry,
+):
+    """Presence Intelligence fused occupancy must reach temporal learning."""
+    bathroom = area_registry.async_create("Guest Bathroom")
+    fused_presence = entity_registry.async_get_or_create(
+        "binary_sensor",
+        "area_presence_forecast",
+        "guest_bathroom_fused_presence",
+    )
+    fused_presence = entity_registry.async_update_entity(
+        fused_presence.entity_id,
+        area_id=bathroom.id,
+        device_class="occupancy",
+    )
+    hass.states.async_set(
+        fused_presence.entity_id,
+        STATE_ON,
+        {"device_class": "occupancy"},
+    )
+
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_INTELLIGENCE_ENABLED: True,
+            CONF_INTELLIGENCE_TRAINING_ENABLED: True,
+        },
+    )
+    context = switch._behavior_context()
+    area_context = context["area_context"]["Guest Bathroom"]
+    temporal = switch._behavior_runtime._temporal_context(
+        switch._behavior_runtime._context_for_area(context, "guest bathroom"),
+        "switch.guest_bathroom_light",
+        "guest bathroom",
+        "on",
+    )
+
+    assert fused_presence.entity_id in switch._discovered_context_entities[
+        CONF_OCCUPANCY_ENTITIES
+    ]
+    assert area_context["occupancy"] == "occupied"
+    assert "occupancy" in area_context["event_times"]
+    assert temporal.categorical_context["occupancy"] == "occupied"
+    assert temporal.event_times["occupancy"] == area_context["event_times"][
+        "occupancy"
+    ]
+
+
 async def test_behavior_context_derives_area_shower_signal_for_future_extractor(
     hass,
     area_registry,

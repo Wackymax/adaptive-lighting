@@ -60,9 +60,11 @@ MAX_ENTITIES = 128
 # Recorder's 16 KiB per-state attribute ceiling once configuration, training,
 # and discovery summaries are included.
 MAX_DIAGNOSTIC_DECISIONS = 12
+MAX_DIAGNOSTIC_REJECTION_ENTITIES = 16
 MAX_TRACKED_CONTEXTS = 512
 MAX_TRACKED_STATES = 256
 MAX_CONTEXT_AGE = timedelta(minutes=10)
+MAX_SERVICE_ATTRIBUTION_AGE = timedelta(seconds=30)
 DEFAULT_REMOVED_RETENTION = timedelta(days=7)
 DEFAULT_EMPTY_DWELL = timedelta(minutes=5)
 DEFAULT_OBSERVATION_WINDOW = timedelta(hours=1)
@@ -201,6 +203,9 @@ class BehaviorProposal:
     ready: bool = False
     executed: bool = False
     behavior_policy: str = BEHAVIOR_AUTHORITY_ON_OFF
+    context_observed_at: str | None = None
+    context_age_seconds: float | None = None
+    context_source: str | None = None
 
     @property
     def service_domain(self) -> str:
@@ -225,6 +230,9 @@ class BehaviorProposal:
             "reason": self.reason,
             "proposal_id": self.proposal_id,
             "behavior_policy": self.behavior_policy,
+            "context_observed_at": self.context_observed_at,
+            "context_age_seconds": self.context_age_seconds,
+            "context_source": self.context_source,
         }
 
 
@@ -560,7 +568,11 @@ class BehaviorRuntimeAdapter:
         self._last_load_reset_reason = "not_loaded"
         self._last_decisions: list[dict[str, Any]] = []
         self._last_rejection_reason: str | None = None
+        self._last_rejection: dict[str, Any] | None = None
+        self._rejection_counts: dict[str, int] = {}
+        self._entity_rejections: dict[str, dict[str, Any]] = {}
         self._last_change_at: datetime | None = None
+        self._last_evaluation_at: datetime | None = None
 
     @staticmethod
     def _duration(value: timedelta | float, name: str) -> timedelta:
@@ -629,9 +641,24 @@ class BehaviorRuntimeAdapter:
             "suppression": suppressions,
             "last_load_reset_reason": self._last_load_reset_reason,
             "last_rejection_reason": self._last_rejection_reason,
+            "last_rejection": (
+                dict(self._last_rejection)
+                if self._last_rejection is not None
+                else None
+            ),
+            "rejection_counts": dict(sorted(self._rejection_counts.items())),
+            "entity_rejections": {
+                entity_id: dict(item)
+                for entity_id, item in sorted(self._entity_rejections.items())
+            },
             "last_change_at": (
                 self._last_change_at.isoformat()
                 if self._last_change_at is not None
+                else None
+            ),
+            "last_evaluation_at": (
+                self._last_evaluation_at.isoformat()
+                if self._last_evaluation_at is not None
                 else None
             ),
         }
@@ -640,6 +667,46 @@ class BehaviorRuntimeAdapter:
         """Retain only the most recent state-attribute explanation window."""
         self._last_decisions.append(dict(decision))
         self._last_decisions = self._last_decisions[-MAX_DIAGNOSTIC_DECISIONS:]
+
+    def _record_rejection(
+        self,
+        reason: str,
+        *,
+        entity_id: str | None = None,
+        action: str | None = None,
+        at: datetime | None = None,
+    ) -> None:
+        """Retain bounded evidence explaining why training was rejected."""
+        self._last_rejection_reason = reason
+        rejected_at = _utc(at)
+        detail: dict[str, Any] = {
+            "reason": reason,
+            "at": rejected_at.isoformat(),
+        }
+        if entity_id is not None:
+            detail["entity_id"] = entity_id
+        if action is not None:
+            detail["action"] = action
+        self._last_rejection = detail
+        self._rejection_counts[reason] = min(
+            1_000_000,
+            self._rejection_counts.get(reason, 0) + 1,
+        )
+        if entity_id is None:
+            return
+        previous = self._entity_rejections.get(entity_id, {})
+        self._entity_rejections[entity_id] = {
+            "count": min(1_000_000, int(previous.get("count", 0)) + 1),
+            "reason": reason,
+            "action": action,
+            "at": rejected_at.isoformat(),
+        }
+        while len(self._entity_rejections) > MAX_DIAGNOSTIC_REJECTION_ENTITIES:
+            oldest = min(
+                self._entity_rejections,
+                key=lambda item: (self._entity_rejections[item]["at"], item),
+            )
+            self._entity_rejections.pop(oldest, None)
 
     @property
     def summary(self) -> Mapping[str, Any]:
@@ -905,7 +972,22 @@ class BehaviorRuntimeAdapter:
         if self._is_own_context(context_id, parent_id, at):
             return
 
-        attribution = self._attributions.get(entity_id)
+        # A service attribution describes one expected power transition. Consume
+        # it at that transition, including when the transition is rejected. A
+        # contextless automation call must never poison later physical actions.
+        attribution = self._attributions.pop(entity_id, None)
+        attribution_max_age = (
+            MAX_SERVICE_ATTRIBUTION_AGE
+            if attribution is None or attribution.context_id is None
+            else max(self.correction_window, timedelta(minutes=15))
+        )
+        if (
+            attribution is not None
+            and not timedelta(0)
+            <= (at - attribution.at)
+            <= attribution_max_age
+        ):
+            attribution = None
         decision = self._attribute_state(
             entity_id,
             action,
@@ -918,7 +1000,12 @@ class BehaviorRuntimeAdapter:
             new_state,
         )
         if decision is None:
-            self._last_rejection_reason = "unattributed_state_change"
+            self._record_rejection(
+                "unattributed_state_change",
+                entity_id=entity_id,
+                action=action,
+                at=at,
+            )
             return
         learned = await self._learn_from_event(
             record,
@@ -935,12 +1022,10 @@ class BehaviorRuntimeAdapter:
         if self._stopped:
             return
         if not learned:
-            self._attributions.pop(entity_id, None)
             return
         await self._record_pending_feedback(record, action, at, decision.provenance)
         if self._stopped:
             return
-        self._attributions.pop(entity_id, None)
         await self._persist()
         if self._stopped:
             return
@@ -1258,7 +1343,12 @@ class BehaviorRuntimeAdapter:
         if self._stopped:
             return False
         if self._context_has_safety(provider_context):
-            self._last_rejection_reason = "safety_context"
+            self._record_rejection(
+                "safety_context",
+                entity_id=record.entity_id,
+                action=action,
+                at=at,
+            )
             return False
         mapping = {
             key: value
@@ -1291,7 +1381,12 @@ class BehaviorRuntimeAdapter:
         )
         result = normalize_behavior_event(mapping)
         if not result.accepted or result.observation is None:
-            self._last_rejection_reason = result.reason
+            self._record_rejection(
+                result.reason or "normalization_rejected",
+                entity_id=record.entity_id,
+                action=action,
+                at=at,
+            )
             return False
         learned = await self._learn_observation(record, result.observation, mapping)
         if (
@@ -1727,9 +1822,13 @@ class BehaviorRuntimeAdapter:
         return changed
 
     def _prune_attributions(self, at: datetime) -> None:
-        cutoff = at - max(self.correction_window, timedelta(minutes=15))
         for entity_id, attribution in list(self._attributions.items()):
-            if attribution.at < cutoff:
+            max_age = (
+                MAX_SERVICE_ATTRIBUTION_AGE
+                if attribution.context_id is None
+                else max(self.correction_window, timedelta(minutes=15))
+            )
+            if attribution.at < at - max_age:
                 del self._attributions[entity_id]
 
     def _next_access(self) -> int:
@@ -1824,6 +1923,14 @@ class BehaviorRuntimeAdapter:
             )
         self._entities = restored
         self._counter = counter
+        self._last_change_at = max(
+            (
+                record.last_human_action_at
+                for record in restored.values()
+                if record.last_human_action_at is not None
+            ),
+            default=None,
+        )
 
     @staticmethod
     def _parse_stored_time(value: Any) -> datetime:
@@ -1886,15 +1993,25 @@ class BehaviorRuntimeAdapter:
         except Exception:
             _LOGGER.exception("Adaptive Lighting behavior diagnostics callback failed")
 
-    def _fresh_context(self, context: Mapping[str, Any], now: datetime) -> bool:
+    def _context_freshness(
+        self,
+        context: Mapping[str, Any],
+        now: datetime,
+    ) -> tuple[bool, datetime | None, float | None, str | None]:
+        """Return freshness with the timestamp evidence used by the gate."""
         observed = _explicit_timestamp(context)
         if observed is None:
-            return False
+            return False, None, None, None
+        age = (now - observed).total_seconds()
         return (
-            0
-            <= (now - observed).total_seconds()
-            <= self.context_max_age.total_seconds()
+            0 <= age <= self.context_max_age.total_seconds(),
+            observed,
+            round(age, 3),
+            "context_timestamp",
         )
+
+    def _fresh_context(self, context: Mapping[str, Any], now: datetime) -> bool:
+        return self._context_freshness(context, now)[0]
 
     @staticmethod
     def _home_state(context: Mapping[str, Any]) -> bool | None:
@@ -1955,7 +2072,12 @@ class BehaviorRuntimeAdapter:
     def _gate_reason(
         self, action: str, context: Mapping[str, Any], now: datetime
     ) -> str | None:
-        if not self._fresh_context(context, now):
+        fresh, observed, age, _source = self._context_freshness(context, now)
+        if observed is None:
+            return "missing_context_timestamp"
+        if age is not None and age < 0:
+            return "future_context_timestamp"
+        if not fresh:
             return "stale_context"
         if self._is_safety(
             _first(context, "safety", "security", "emergency", "alarm", default=""),
@@ -2023,6 +2145,7 @@ class BehaviorRuntimeAdapter:
         if self._stopped:
             return ()
         at = _utc(now)
+        self._last_evaluation_at = at
         changed = self._reconcile_candidates(at)
         context_mapping = dict(await self._get_context())
         if self._stopped:
@@ -2116,6 +2239,12 @@ class BehaviorRuntimeAdapter:
                 continue
             action = "on" if current == STATE_OFF else "off"
             entity_context = self._context_for_area(context_mapping, record.area)
+            (
+                _,
+                context_observed_at,
+                context_age_seconds,
+                context_source,
+            ) = self._context_freshness(entity_context, at)
             gate_reason = (
                 "recent_manual_action"
                 if record.last_human_action_at is not None
@@ -2189,6 +2318,13 @@ class BehaviorRuntimeAdapter:
                 ready,
                 executed,
                 candidate.behavior_policy,
+                (
+                    context_observed_at.isoformat()
+                    if context_observed_at is not None
+                    else None
+                ),
+                context_age_seconds,
+                context_source,
             )
             proposals.append(proposal)
             self._remember_decision(proposal.as_dict())

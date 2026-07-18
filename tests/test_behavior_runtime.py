@@ -772,6 +772,102 @@ async def test_unrelated_automation_and_compound_alarm_are_rejected(hass) -> Non
     )
     assert not accepted
     assert runtime.diagnostics["accepted_observations"] == 0
+    assert runtime.diagnostics["entity_rejections"]["light.living"] == {
+        "count": 2,
+        "reason": "unattributed_state_change",
+        "action": "off",
+        "at": BASE_TIME.isoformat(),
+    }
+    await runtime.async_stop()
+
+
+async def test_rejected_contextless_attribution_is_consumed(hass) -> None:
+    """An automation rejection must not poison the next physical action."""
+    accepted = []
+    runtime = await _runtime(hass, [_light()], on_accepted_observation=accepted.append)
+    automation_context = Context()
+    await runtime.async_process_call_service(
+        _call_event(
+            "light.living",
+            "on",
+            source="automation",
+            context=automation_context,
+        ),
+    )
+    await runtime.async_process_state_change(
+        _state_event("light.living", "on", context=automation_context),
+    )
+
+    await runtime.async_process_state_change(
+        _state_event(
+            "light.living",
+            "off",
+            at=BASE_TIME + timedelta(seconds=5),
+            context=Context(id="physical-device"),
+        ),
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0].source == "physical"
+    assert runtime.diagnostics["accepted_observations"] == 1
+    assert "light.living" not in runtime._attributions
+    await runtime.async_stop()
+
+
+async def test_expired_contextless_attribution_does_not_block_physical_action(
+    hass,
+) -> None:
+    accepted = []
+    runtime = await _runtime(hass, [_light()], on_accepted_observation=accepted.append)
+    await runtime.async_process_call_service(
+        _call_event(
+            "light.living",
+            "on",
+            source="automation",
+            context=Context(),
+        ),
+    )
+
+    await runtime.async_process_state_change(
+        _state_event(
+            "light.living",
+            "on",
+            at=BASE_TIME + timedelta(seconds=31),
+            context=Context(id="physical-device"),
+        ),
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0].source == "physical"
+    await runtime.async_stop()
+
+
+async def test_delayed_contextful_automation_remains_rejected(hass) -> None:
+    """A delayed state with matching HA context must not look physical."""
+    accepted = []
+    runtime = await _runtime(hass, [_light()], on_accepted_observation=accepted.append)
+    automation_context = Context(id="automation-context")
+    await runtime.async_process_call_service(
+        _call_event(
+            "light.living",
+            "on",
+            source="automation",
+            context=automation_context,
+        ),
+    )
+
+    await runtime.async_process_state_change(
+        _state_event(
+            "light.living",
+            "on",
+            at=BASE_TIME + timedelta(seconds=31),
+            context=automation_context,
+        ),
+    )
+
+    assert not accepted
+    assert runtime.diagnostics["accepted_observations"] == 0
+    assert "light.living" not in runtime._attributions
     await runtime.async_stop()
 
 
@@ -1080,10 +1176,76 @@ async def test_missing_or_invalid_context_timestamp_fails_freshness_closed(
     invalid = await runtime.async_evaluate(now=BASE_TIME)
 
     assert missing
-    assert missing[0].reason == "stale_context"
+    assert missing[0].reason == "missing_context_timestamp"
+    assert missing[0].context_observed_at is None
+    assert missing[0].context_age_seconds is None
     assert invalid
-    assert invalid[0].reason == "stale_context"
+    assert invalid[0].reason == "missing_context_timestamp"
     assert runtime.models["light.living"].pending_proposal_count == 0
+    await runtime.async_stop()
+
+
+async def test_decision_diagnostics_explain_context_freshness(hass) -> None:
+    context = _context(timestamp=BASE_TIME - timedelta(seconds=45))
+    runtime = await _runtime(
+        hass,
+        [_light()],
+        context=context,
+        min_probability=0.0,
+        min_confidence=0.0,
+        min_effective_support=0.1,
+        min_freshness=0.0,
+    )
+    runtime._states["light.living"] = "off"
+
+    proposals = await runtime.async_evaluate(now=BASE_TIME)
+
+    assert proposals
+    assert proposals[0].context_observed_at == context["timestamp"].isoformat()
+    assert proposals[0].context_age_seconds == 45.0
+    assert proposals[0].context_source == "context_timestamp"
+    assert runtime.diagnostics["last_evaluation_at"] == BASE_TIME.isoformat()
+    await runtime.async_stop()
+
+
+async def test_presence_intelligence_area_signal_is_used_for_learning(hass) -> None:
+    """Fused room presence must enter the accepted observation features."""
+    context = _context(
+        occupancy="unknown",
+        area_context={
+            "Guest Bathroom": {
+                "occupancy": "occupied",
+                "presence": "unknown",
+                "event_times": {"occupancy": BASE_TIME},
+                "state_dwell": {"occupancy": 0.0},
+                "categorical_context": {"occupancy": "occupied"},
+            },
+        },
+    )
+    runtime = await _runtime(
+        hass,
+        [_light("switch.guest_bathroom_light", area="guest bathroom", domain="switch", explicit_light_switch=True)],
+        context=context,
+    )
+
+    await runtime.async_process_state_change(
+        _state_event(
+            "switch.guest_bathroom_light",
+            "on",
+            context=Context(id="physical-device"),
+        ),
+    )
+    temporal = runtime._temporal_context(
+        runtime._context_for_area(context, "guest bathroom"),
+        "switch.guest_bathroom_light",
+        "guest bathroom",
+        "on",
+    )
+
+    assert runtime.diagnostics["sample_counts"]["switch.guest_bathroom_light"] == 1
+    assert temporal.categorical_context["occupancy"] == "occupied"
+    assert temporal.event_times["occupancy"] == BASE_TIME
+    assert temporal.state_dwell["occupancy"] == 0.0
     await runtime.async_stop()
 
 
